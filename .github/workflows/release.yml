@@ -283,6 +283,12 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Secure Python certificate dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade "pip>=26.2.2"
+          python -m pip install --upgrade "certifi>=2026.10.19"
+
       - name: Validate tag matches src/qwenpaw/__version__.py
         run: |
           python -m pip install --quiet packaging
@@ -331,10 +337,16 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Secure Python certificate dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade "pip>=26.2.2"
+          python -m pip install --upgrade "certifi>=2026.10.19"
+
       - name: Set up Node (for console build)
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version-file: .nvmrc
           cache: "npm"
           cache-dependency-path: console/package-lock.json
 
@@ -356,7 +368,6 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          python -m pip install --upgrade pip
           pip install setuptools wheel build
 
       - name: Build package
@@ -386,8 +397,8 @@ jobs:
       ref: ${{ needs.resolve.outputs.sha }}
       # On dry_run (fork) the private ACR base images are unreachable, so fall
       # back to public images for the Docker health-check build.
-      docker_node_image: ${{ inputs.dry_run && 'node:20-slim' || '' }}
-      docker_uv_image: ${{ inputs.dry_run && 'ghcr.io/astral-sh/uv:latest' || '' }}
+      docker_node_image: ${{ inputs.dry_run && 'node:22.23.4-slim' || '' }}
+      docker_uv_image: ${{ inputs.dry_run && 'ghcr.io/astral-sh/uv:0.13.4' || '' }}
     secrets: inherit
 
   build-desktop:
@@ -410,10 +421,21 @@ jobs:
         with:
           python-version: "3.11"
 
+      - name: Secure Python certificate dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade "pip>=26.2.2"
+          python -m pip install --upgrade "certifi>=2026.10.19"
+
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version-file: .nvmrc
+
+      - name: Build OpenUI plugin
+        run: |
+          npm --prefix plugins/bundle/qwenpaw-openui/frontend ci
+          npm --prefix plugins/bundle/qwenpaw-openui/frontend test
 
       - name: Build memory plugin frontends
         shell: bash
@@ -479,8 +501,8 @@ jobs:
 
       - name: Build multi-arch image
         env:
-          DOCKER_NODE_IMAGE: ${{ inputs.dry_run && 'node:20-slim' || '' }}
-          DOCKER_UV_IMAGE: ${{ inputs.dry_run && 'ghcr.io/astral-sh/uv:latest' || '' }}
+          DOCKER_NODE_IMAGE: ${{ inputs.dry_run && 'node:22.23.4-slim' || '' }}
+          DOCKER_UV_IMAGE: ${{ inputs.dry_run && 'ghcr.io/astral-sh/uv:0.13.4' || '' }}
           QWENPAW_DISABLED_CHANNELS: "imessage"
           QWENPAW_VERSION: ${{ steps.version.outputs.version }}
         run: |
@@ -491,7 +513,7 @@ jobs:
           if [ -n "${DOCKER_UV_IMAGE}" ]; then
             BUILD_ARGS+=(--build-arg "UV_IMAGE=${DOCKER_UV_IMAGE}")
           fi
-          docker buildx build --platform linux/amd64,linux/arm64 \
+          docker buildx build --pull --no-cache --platform linux/amd64,linux/arm64 \
             -f deploy/Dockerfile \
             --build-arg QWENPAW_DISABLED_CHANNELS="${QWENPAW_DISABLED_CHANNELS}" \
             --build-arg \
@@ -510,7 +532,7 @@ jobs:
   # ── Gate: publish jobs below run only if every prepare job above is green ──
 
   publish-pypi:
-    needs: [resolve, build-wheel, verify-web, build-desktop, build-plugins, build-docker]
+    needs: [resolve, build-wheel, verify-web, build-desktop, build-plugins, build-docker, full-test-gate]
     runs-on: ubuntu-latest
     steps:
       - name: Download dist artifacts
@@ -532,7 +554,7 @@ jobs:
           echo "DRY-RUN: would publish $(ls dist) to PyPI"
 
   push-docker:
-    needs: [resolve, build-wheel, verify-web, build-desktop, build-plugins, build-docker]
+    needs: [resolve, build-wheel, verify-web, build-desktop, build-plugins, build-docker, full-test-gate]
     runs-on: ubuntu-latest
     env:
       ACR_REGISTRY: agentscope-registry.ap-southeast-1.cr.aliyuncs.com
@@ -614,7 +636,7 @@ jobs:
           echo "DRY-RUN: would push the prebuilt Docker image for ${{ needs.resolve.outputs.tag }}"
 
   publish-desktop:
-    needs: [resolve, build-wheel, verify-web, build-desktop, build-plugins, build-docker]
+    needs: [resolve, build-wheel, verify-web, build-desktop, build-plugins, build-docker, full-test-gate]
     uses: ./.github/workflows/desktop-publish.yml
     with:
       tag: ${{ needs.resolve.outputs.tag }}
@@ -623,7 +645,7 @@ jobs:
     secrets: inherit
 
   publish-plugins:
-    needs: [resolve, build-wheel, verify-web, build-desktop, build-plugins, build-docker]
+    needs: [resolve, build-wheel, verify-web, build-desktop, build-plugins, build-docker, full-test-gate]
     runs-on: ubuntu-latest
     env:
       OSS_BUCKET: ${{ vars.OSS_BUCKET || 'qwenpaw-download' }}
@@ -636,6 +658,12 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
+      - name: Secure Python certificate dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade "pip>=26.2.2"
+          python -m pip install --upgrade "certifi>=2026.10.19"
 
       - name: Download plugins dist
         uses: actions/download-artifact@v4
@@ -690,7 +718,11 @@ jobs:
             --new dist/plugins/index.json \
             --old existing-index.json \
             --out dist/plugins/index.json \
-            --retire-plugin-id computer-use-tool
+            --retire-plugin-id computer-use-tool \
+            --retire-plugin-id qwenpaw-hub \
+            --retire-plugin-id clawhub-hub \
+            --retire-plugin-id modelscope-hub \
+            --retire-plugin-id aliyun-hub
 
       - name: Upload plugins index (short-cache)
         if: ${{ !inputs.dry_run }}
@@ -729,10 +761,36 @@ jobs:
   # duplicated. finalize needs this job, so a red gate means the draft is
   # never flipped to published.
   #
-  # E2E scope in this form (maintainer decision 2026-09-09): the p0 blocking
-  # set only (64 reviewed node ids, see .github/ci/e2e-release-gate-manifest.md);
-  # the 7 currently-red p0 cases run as report-only (e2e-release-watch) and
-  # p1/p2 stay in the nightly form. Backend tiers are fully blocking here.
+  # E2E scope in this form: the p0 set only, split into a reviewed blocking
+  # list (64 node ids) and a watch list (7 node ids) -- see
+  # .github/ci/e2e-release-gate-manifest.md. p1/p2 stay in the nightly form.
+  # Backend tiers are fully blocking here.
+  #
+  # BOTH E2E lists are blocking: the watch set was report-only from 2026-09-10
+  # until 2026-09-18, when it was promoted to blocking on maintainer
+  # instruction ("upgrade e2e to block level too, consistent with the other
+  # accumulated tests"). Attribution of the earlier report-only state: the
+  # p0-only scope was a maintainer decision on 2026-09-09 ("release e2e runs
+  # p0 only; p1/p2 can wait for the nightly run"), but splitting off the 7
+  # then-red cases as report-only was an implementation split proposed by Qin
+  # Qiong the same day and only tacitly accepted -- it was never an explicit
+  # maintainer decision, and the old comment claimed otherwise.
+  #
+  # NOTE on what each layer actually stops (learned from run 35204357591):
+  # - A red e2e-release-watch ALREADY blocked finalize before this change: that
+  #   job has no continue-on-error, so its failure reddens the whole reusable
+  #   workflow, which reddens full-test-gate, which skips finalize. In that run
+  #   finalize was skipped at 10:19:39 and the release stayed draft.
+  # - What that run leaked was the ARTIFACTS: the four publish-* jobs did not
+  #   list full-test-gate in their needs, so they shipped at 10:04-10:09 while
+  #   the gate was still running (Test Summary concluded at 10:19:38).
+  # So promoting the watch set to blocking only removes the false green in Test
+  # Summary; gating the publish jobs on full-test-gate (added below) is what
+  # stops artifacts. Both changes are needed for the gate to mean what it says.
+  #
+  # finalize keeps its explicit full-test-gate dependency even though it now
+  # also inherits it transitively through the publish jobs: an explicit edge
+  # documents the intent and survives later edits to the publish needs lists.
   full-test-gate:
     needs: [resolve]
     uses: ./.github/workflows/full-tests-nightly.yml

@@ -15,6 +15,7 @@ from agentscope.message import HintBlock, Msg, TextBlock
 from reme.config import parse_action, parse_kwargs
 
 from ..config.config import get_model_max_input_length, load_agent_config
+from ..config.history_path import resolve_history_db_path
 from ..constant import DEBUG_HISTORY_FILE, MAX_LOAD_HISTORY_COUNT
 from ..exceptions import SystemCommandException
 from ..loop.gates.runner import clear_pending_gate_state
@@ -645,7 +646,10 @@ class CommandHandler(ConversationCommandHandlerMixin):
             sc = lcc.scroll_config
             history = await run_sync_io(
                 HistoryStore,
-                Path(self._workspace_dir) / sc.db_filename,
+                resolve_history_db_path(
+                    self._workspace_dir,
+                    sc.db_filename,
+                ),
             )
             # Must match the id normal turns persist under (the builder uses
             # ``ctx.session_id``), so these rows align with the live history.
@@ -780,7 +784,7 @@ class CommandHandler(ConversationCommandHandlerMixin):
         history_str = await format_history_str(
             self._state,
             get_token_counter(agent_config),
-            get_model_max_input_length(agent_config),
+            (await run_sync_io(get_model_max_input_length, agent_config)),
         )
 
         # Truncate if too long

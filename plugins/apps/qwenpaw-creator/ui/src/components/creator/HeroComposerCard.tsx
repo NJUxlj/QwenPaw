@@ -4,6 +4,7 @@ import { Input, Select, Tooltip } from "antd";
 import type { InputRef } from "antd";
 import {
   EyeOutlined,
+  MessageOutlined,
   PictureOutlined,
   VideoCameraOutlined,
 } from "@ant-design/icons";
@@ -147,6 +148,13 @@ export default function HeroComposerCard() {
           <TextArea
             value={projectDescription}
             onChange={(e) => setProjectDescription(e.target.value)}
+            onPaste={(e) => {
+              const files = Array.from(e.clipboardData?.files ?? []);
+              if (files.length > 0) {
+                e.preventDefault();
+                addFiles(files, "file");
+              }
+            }}
             autoSize={{ minRows: 2, maxRows: 10 }}
             placeholder={t(SCENARIO_TERMS[scenario].descriptionKey)}
             className="!border-none !bg-transparent !px-4 !pb-2 !pt-3 !text-sm !leading-6 !shadow-none focus:!shadow-none"
@@ -190,6 +198,10 @@ export default function HeroComposerCard() {
               </span>
               {missingRequiredModels!.map((type) => {
                 const meta = {
+                  llm: {
+                    label: "LLM",
+                    icon: <MessageOutlined style={{ fontSize: 10 }} />,
+                  },
                   vlm: {
                     label: "VLM",
                     icon: <EyeOutlined style={{ fontSize: 10 }} />,

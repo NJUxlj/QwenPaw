@@ -1,3 +1,6 @@
+vi.mock("../../plugins/pawapp-sdk/browserSession", () => ({
+  prepareBrowserSession: vi.fn().mockResolvedValue(null),
+}));
 // @vitest-environment jsdom
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { Modal } from "antd";
@@ -428,7 +431,10 @@ describe("AppCenterPage", () => {
     await screen.findByText("alpha-app");
 
     fireEvent.click(
-      screen.getByRole("button", { name: /appCenter.uninstall/ }),
+      screen.getByRole("button", { name: "appCenter.moreActions" }),
+    );
+    fireEvent.click(
+      await screen.findByRole("menuitem", { name: /appCenter.uninstall/ }),
     );
 
     await waitFor(() =>

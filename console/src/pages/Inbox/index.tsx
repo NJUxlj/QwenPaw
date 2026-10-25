@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
+import { useLocation, useSearchParams } from "react-router-dom";
 import {
   Tabs,
   Empty,
@@ -17,12 +18,15 @@ import {
   Tooltip,
 } from "antd";
 import {
-  BulbOutlined,
-  CopyOutlined,
-  DownOutlined,
-  SafetyOutlined,
-  ToolOutlined,
-} from "@ant-design/icons";
+  Lightbulb as BulbOutlined,
+  Copy as CopyOutlined,
+  ChevronDown as DownOutlined,
+  LoaderCircle,
+  RefreshCcw,
+  ShieldCheck as SafetyOutlined,
+  TriangleAlert,
+  Wrench as ToolOutlined,
+} from "lucide-react";
 import { PackageOpen, Bell, BellRing } from "lucide-react";
 import { MailAccessControlDrawer } from "./components/MailAccessControlDrawer";
 import { MailProcessingPauses } from "./components/MailProcessingPauses";
@@ -143,7 +147,14 @@ const getMailDetail = (messageItem: PushMessage | null): MailDetail | null => {
 
 export default function InboxPage() {
   const { t } = useTranslation();
-  const [activeTab, setActiveTab] = useState<TabKey>(resolveInitialTab);
+  const location = useLocation();
+  const [searchParams] = useSearchParams();
+  const requestedTab = searchParams.get("tab");
+  const [activeTab, setActiveTab] = useState<TabKey>(() =>
+    requestedTab === "approvals" || requestedTab === "messages"
+      ? requestedTab
+      : resolveInitialTab(),
+  );
   const [mailAclDrawerOpen, setMailAclDrawerOpen] = useState(false);
   const {
     pendingCount,
@@ -167,10 +178,13 @@ export default function InboxPage() {
   const {
     summary,
     pushMessages,
+    pushMessagesLoading,
+    pushMessagesError,
     markMessageAsRead,
     markAllMessagesAsRead,
     deleteMessage,
     deleteMessages,
+    refreshPushMessages,
   } = useInboxData();
   const agentDisplayNameById = useMemo(
     () =>
@@ -304,6 +318,12 @@ export default function InboxPage() {
   );
 
   useEffect(() => {
+    if (requestedTab === "approvals" || requestedTab === "messages") {
+      setActiveTab(requestedTab);
+    }
+  }, [location.key, requestedTab]);
+
+  useEffect(() => {
     if (typeof window !== "undefined") {
       window.localStorage.setItem(INBOX_TAB_STORAGE_KEY, activeTab);
     }
@@ -391,7 +411,10 @@ export default function InboxPage() {
           <Bell size={16} />
           {t("inbox.tabPushMessages")}
           {summary.pushMessages.unread > 0 && (
-            <Badge count={summary.pushMessages.unread} color="#ff7f16" />
+            <Badge
+              count={summary.pushMessages.unread}
+              color="var(--app-accent)"
+            />
           )}
         </span>
       ),
@@ -473,7 +496,31 @@ export default function InboxPage() {
               )}
             </div>
           </div>
-          {filteredPushMessages.length > 0 ? (
+          {pushMessagesError ? (
+            <div className={styles.messagesError} role="alert">
+              <TriangleAlert size={18} aria-hidden="true" />
+              <span>{t("inbox.loadFailed")}</span>
+              <Button
+                icon={<RefreshCcw size={16} />}
+                loading={pushMessagesLoading}
+                onClick={() => void refreshPushMessages()}
+              >
+                {t("common.retry")}
+              </Button>
+            </div>
+          ) : null}
+          {pushMessagesLoading && pushMessages.length === 0 ? (
+            <div className={styles.messagesLoading} role="status">
+              <LoaderCircle
+                className={styles.messagesLoadingIcon}
+                size={20}
+                aria-hidden="true"
+              />
+              <span>{t("common.loading")}</span>
+            </div>
+          ) : pushMessagesError &&
+            pushMessages.length === 0 ? null : filteredPushMessages.length >
+            0 ? (
             <div className={styles.cardList}>
               {pagedPushMessages.map((item) => (
                 <PushMessageCard
@@ -510,7 +557,9 @@ export default function InboxPage() {
         <span className={styles.tabLabel}>
           <PackageOpen size={16} />
           {t("inbox.tabApprovals")}
-          {approvalCount > 0 && <Badge count={approvalCount} color="#ff7f16" />}
+          {approvalCount > 0 && (
+            <Badge count={approvalCount} color="var(--app-accent)" />
+          )}
         </span>
       ),
       children: (
@@ -586,12 +635,10 @@ export default function InboxPage() {
         extra={
           <Badge dot={pendingCount > 0} offset={[-4, 4]}>
             <Button
-              icon={<SafetyOutlined />}
-              className={
-                mailAclNewArrival && wobbleEnabled
-                  ? styles.mailAclShake
-                  : undefined
-              }
+              icon={<SafetyOutlined size="1em" />}
+              className={`${styles.mailAclButton} ${
+                mailAclNewArrival && wobbleEnabled ? styles.mailAclShake : ""
+              }`}
               onMouseEnter={markMailAclSeen}
               onClick={() => {
                 markMailAclSeen();
@@ -622,9 +669,9 @@ export default function InboxPage() {
                 size="small"
                 icon={<BellRing size={16} />}
                 onClick={toggleWobble}
-                className={
-                  wobbleEnabled ? styles.wobbleToggleActive : undefined
-                }
+                className={`${styles.wobbleToggle} ${
+                  wobbleEnabled ? styles.wobbleToggleActive : ""
+                }`}
               />
             </Tooltip>
           }
@@ -726,7 +773,7 @@ export default function InboxPage() {
                       >
                         {entry.type === "tool_call" ? (
                           <span className={styles.mailTraceTool}>
-                            <ToolOutlined /> {entry.name || "tool"}
+                            <ToolOutlined size="1em" /> {entry.name || "tool"}
                           </span>
                         ) : null}
                         <pre className={styles.mailTraceSummary}>
@@ -775,9 +822,9 @@ export default function InboxPage() {
                         const foldIcon = kind
                           .toLowerCase()
                           .includes("thinking") ? (
-                          <BulbOutlined />
+                          <BulbOutlined size="1em" />
                         ) : kind.toLowerCase().includes("tool") ? (
-                          <ToolOutlined />
+                          <ToolOutlined size="1em" />
                         ) : null;
                         const collapseKey = `trace-${item.at}-${index}`;
                         const isPanelActive = !!expandedTraceMap[collapseKey];
@@ -838,7 +885,7 @@ export default function InboxPage() {
                                               : ""
                                           }`}
                                         >
-                                          <DownOutlined />
+                                          <DownOutlined size="1em" />
                                         </span>
                                       </div>
                                     ),
@@ -875,7 +922,7 @@ export default function InboxPage() {
                                                   }
                                                   title={t("common.copy")}
                                                 >
-                                                  <CopyOutlined />
+                                                  <CopyOutlined size="1em" />
                                                 </button>
                                               </div>
                                               <pre
@@ -917,7 +964,7 @@ export default function InboxPage() {
                                                   }
                                                   title={t("common.copy")}
                                                 >
-                                                  <CopyOutlined />
+                                                  <CopyOutlined size="1em" />
                                                 </button>
                                               </div>
                                               <pre

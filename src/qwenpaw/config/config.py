@@ -36,6 +36,7 @@ from qwenpaw.exceptions import (
     ConfigurationException,
 )
 
+from .history_path import normalize_history_db_filename
 from .timezone import detect_system_timezone
 from ..constant import (
     HEARTBEAT_DEFAULT_EVERY,
@@ -51,6 +52,70 @@ from ..utils.logging import sanitize_log_value
 logger = logging.getLogger(__name__)
 
 AUTO_FIN_MAX_WINDOW_HOURS = 168
+
+_CSS_HEX_COLOR_RE = re.compile(
+    r"^#(?:[0-9a-fA-F]{3,4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$",
+)
+_CSS_COLOR_FUNCTION_RE = re.compile(
+    r"^(rgb|rgba|hsl|hsla)\(([^()]*)\)$",
+    re.IGNORECASE,
+)
+_CSS_NUMBER_PATTERN = r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)"
+_CSS_NUMBER_RE = re.compile(rf"^{_CSS_NUMBER_PATTERN}$")
+_CSS_PERCENT_RE = re.compile(rf"^{_CSS_NUMBER_PATTERN}%$")
+_CSS_HUE_RE = re.compile(
+    rf"^{_CSS_NUMBER_PATTERN}(?:deg|grad|rad|turn)?$",
+    re.IGNORECASE,
+)
+_CSS_RADIUS_RE = re.compile(r"^(?:0|(?:0|[1-9]\d*)(?:\.\d+)?px)$")
+
+
+def _is_safe_css_color(value: str) -> bool:
+    """Return whether a value is a supported standalone CSS color."""
+    normalized = value.strip()
+    if _CSS_HEX_COLOR_RE.fullmatch(normalized):
+        return True
+
+    match = _CSS_COLOR_FUNCTION_RE.fullmatch(normalized)
+    if match is None:
+        return False
+
+    function_name, body = match.groups()
+    if "," in body:
+        parts = [part.strip() for part in body.split(",")]
+        channels = parts[:3]
+        alpha = parts[3] if len(parts) == 4 else None
+        valid_syntax = "/" not in body and len(parts) in (3, 4) and all(parts)
+    else:
+        slash_parts = body.split("/")
+        channels = slash_parts[0].split()
+        alpha = slash_parts[1].strip() if len(slash_parts) == 2 else None
+        valid_syntax = (
+            len(slash_parts) <= 2
+            and len(channels) == 3
+            and (alpha is None or bool(alpha))
+        )
+
+    if not valid_syntax:
+        return False
+
+    if alpha is not None and not (
+        _CSS_NUMBER_RE.fullmatch(alpha) or _CSS_PERCENT_RE.fullmatch(alpha)
+    ):
+        return False
+
+    if function_name.lower().startswith("rgb"):
+        return all(
+            _CSS_NUMBER_RE.fullmatch(channel)
+            or _CSS_PERCENT_RE.fullmatch(channel)
+            for channel in channels
+        )
+    return bool(
+        _CSS_HUE_RE.fullmatch(channels[0])
+        and _CSS_PERCENT_RE.fullmatch(channels[1])
+        and _CSS_PERCENT_RE.fullmatch(channels[2]),
+    )
+
 
 # A legacy field can be present in the root config and in several agent
 # profiles, all of which may be validated repeatedly during one process
@@ -132,6 +197,9 @@ def _assert_agent_config_unchanged(
 # ============================================================================
 
 
+ModelType = Literal["chat", "decision"]
+
+
 class ModelSlotConfig(BaseModel):
     """Model slot configuration for LLM routing."""
 
@@ -143,6 +211,9 @@ class ActiveModelsInfo(BaseModel):
     """Active models information for provider manager."""
 
     active_llm: ModelSlotConfig | None
+    default_models: Dict[ModelType, ModelSlotConfig | None] = Field(
+        default_factory=dict,
+    )
     effective_max_input_length: int | None = None
 
 
@@ -349,6 +420,8 @@ class FeishuConfig(BaseChannelConfig):
     domain: 'feishu' for China, 'lark' for international.
     streaming_enabled: enable CardKit streaming card updates for real-time
     typewriter-style text output.
+    auto_collapse_thinking: collapse the reasoning panel when its stream
+    finishes (the panel stays manually collapsible either way).
     share_session_in_group: if True, all group members share one session;
     if False (default), each member gets an independent session.
     """
@@ -372,6 +445,9 @@ class FeishuConfig(BaseChannelConfig):
 
     streaming_enabled: bool = False
     share_session_in_group: bool = False
+    # Auto-collapse the reasoning panel once a stream finishes. The panel is
+    # always collapsible by hand; this only controls the automatic collapse.
+    auto_collapse_thinking: bool = False
 
 
 class QQConfig(BaseChannelConfig):
@@ -1147,17 +1223,25 @@ class ScrollContextConfig(BaseModel):
     """Scroll (retrieval-driven) context manager configuration.
 
     Only consulted when ``LightContextConfig.strategy == "scroll"``. The
-    durable history lives at ``{working_dir}/{db_filename}``; evicted turns
-    fold into an in-context eviction index recallable from the sandboxed
-    ``recall_history_python`` REPL.
+    durable history uses ``db_filename`` (relative to the workspace unless
+    absolute). Evicted turns fold into an in-context eviction index,
+    recallable from the sandboxed ``recall_history_python`` REPL.
     """
 
     model_config = ConfigDict(extra="ignore")
 
     db_filename: str = Field(
         default="history.db",
-        description="SQLite history store filename, relative to working_dir.",
+        description=(
+            f"SQLite history path, absolute or relative to the workspace."
+        ),
     )
+
+    @field_validator("db_filename")
+    @classmethod
+    def validate_db_filename(cls, value: str) -> str:
+        """Normalize the configured durable history filename."""
+        return normalize_history_db_filename(value)
 
     tool_output_token_cap: int = Field(
         default=3000,
@@ -1294,8 +1378,8 @@ class LightContextConfig(BaseModel):
 class AutoTitleConfig(BaseModel):
     """Async chat-title generation configuration.
 
-    The console handler creates each new chat with a 10-character
-    placeholder name and spawns a background task that asks the active
+    The console handler creates each new chat with a placeholder name bounded
+    to 500 characters and spawns a background task that asks the active
     LLM for a concise title. Each new chat costs one short extra LLM
     call; flip ``enabled`` to ``False`` to keep the placeholder and
     avoid the spend.
@@ -1307,7 +1391,7 @@ class AutoTitleConfig(BaseModel):
         default=True,
         description=(
             "Generate a chat title via the active LLM after the first "
-            "user message. Disable to keep the truncated placeholder "
+            "user message. Disable to keep the placeholder "
             "and skip the extra per-chat LLM call."
         ),
     )
@@ -1526,7 +1610,7 @@ class GoalLoopModeConfig(BaseModel):
     """Editable values for the fixed built-in Goal pipeline."""
 
     max_iterations: int = Field(default=20, ge=1, le=500)
-    max_tokens: int = Field(default=300_000, ge=1)
+    max_tokens: int = Field(default=0, ge=-1)
 
 
 class MissionLoopModeConfig(BaseModel):
@@ -2015,6 +2099,123 @@ class CodingModeConfig(BaseModel):
     )
 
 
+AdvisorThinkingLevel = Literal["inherit", "off", "low", "medium", "high"]
+
+
+class AdvisorInterventionConfig(BaseModel):
+    """When the advisor is called back in mid-run (Advisor Mode).
+
+    The trigger fires on ``consecutive_failures`` failed tool calls in a
+    row, or ``window_failures`` failures within the last ``window_size``
+    steps. Counters reset after each intervention.
+    """
+
+    consecutive_failures: int = Field(
+        default=3,
+        ge=1,
+        description=(
+            "Failed tool calls in a row before the advisor is consulted"
+        ),
+    )
+    window_size: int = Field(
+        default=10,
+        ge=1,
+        description="Number of recent steps the failure window spans",
+    )
+    window_failures: int = Field(
+        default=4,
+        ge=1,
+        description=(
+            "Failed tool calls within the window before the advisor is "
+            "consulted"
+        ),
+    )
+    cooldown_steps: int = Field(
+        default=0,
+        ge=0,
+        description="Steps to wait after an intervention before the next",
+    )
+    max_interventions: int = Field(
+        default=3,
+        ge=0,
+        description="Maximum automatic interventions per run",
+    )
+
+
+class AdvisorModeConfig(BaseModel):
+    """Configuration for Advisor Mode (stored in agent.json).
+
+    In Advisor Mode the agent's primary model acts as the advisor: it
+    writes a strategic plan before the agent's first step and is consulted
+    again when the agent keeps failing. The agent itself (the worker) runs
+    on the cheaper ``subagent_model`` when one is configured.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description="Enable Advisor Mode for this agent",
+    )
+    plan_enabled: bool = Field(
+        default=True,
+        description=(
+            "Ask the advisor for a plan before the agent's first step"
+        ),
+    )
+    followup_enabled: bool = Field(
+        default=True,
+        description=(
+            "Consult the advisor again mid-run when repeated tool "
+            "failures are detected"
+        ),
+    )
+    on_demand_enabled: bool = Field(
+        default=True,
+        description=(
+            "Expose a consult_advisor tool so the agent can ask the "
+            "advisor on its own"
+        ),
+    )
+    max_consults: int = Field(
+        default=32,
+        ge=0,
+        description="Maximum on-demand consultations per conversation",
+    )
+    recent_messages: int = Field(
+        default=20,
+        ge=1,
+        description=(
+            "How many of the agent's latest messages the advisor sees at "
+            "each intervention or consultation. Every text, tool call and "
+            "tool result counts as one"
+        ),
+    )
+    intervention: AdvisorInterventionConfig = Field(
+        default_factory=AdvisorInterventionConfig,
+        description="Thresholds for the mid-run auto intervention",
+    )
+    advisor_model: Optional[ModelSlotConfig] = Field(
+        default=None,
+        description=(
+            "Model that answers as the advisor. None means the agent's "
+            "primary model"
+        ),
+    )
+    worker_model: Optional[ModelSlotConfig] = Field(
+        default=None,
+        description=(
+            "Model the agent runs on while Advisor Mode is on. None means "
+            "the sub-agent model, or the primary model when none is set"
+        ),
+    )
+    advisor_thinking: AdvisorThinkingLevel = Field(
+        default="off",
+        description=(
+            "Thinking level for the advisor's own calls. 'inherit' "
+            "follows the agent and model defaults"
+        ),
+    )
+
+
 class FallbackPolicyConfig(BaseModel):
     """Policy controlling cross-model fallback targets."""
 
@@ -2240,9 +2441,13 @@ class AgentProfileConfig(BaseModel):
     project_dir: Optional[str] = Field(
         default=None,
         description=(
-            "Default project directory for tools and project files. "
+            "Primary default project directory (legacy single-path view). "
             "None means use workspace_dir."
         ),
+    )
+    project_dirs: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Ordered default project directories, primary first.",
     )
     backend: str = Field(
         default="qwenpaw",
@@ -2286,13 +2491,19 @@ class AgentProfileConfig(BaseModel):
         default=None,
         description="Active model for this agent (provider_id + model)",
     )
+    decision_model: Optional["ModelSlotConfig"] = Field(
+        default=None,
+        description=(
+            "Decision model for this agent; None disables it by default"
+        ),
+    )
     fallback_models: List["ModelSlotConfig"] = Field(
         default_factory=list,
-        description="Ordered model fallback chain for transient failures",
+        description="Ordered chat model fallback chain for transient failures",
     )
     fallback_policy: FallbackPolicyConfig = Field(
         default_factory=FallbackPolicyConfig,
-        description="Cross-model fallback policy",
+        description="Chat model fallback policy",
     )
     subagent_model: Optional["ModelSlotConfig"] = Field(
         default=None,
@@ -2301,13 +2512,25 @@ class AgentProfileConfig(BaseModel):
     thinking_level: Literal[
         "inherit",
         "off",
+        "minimal",
         "low",
         "medium",
         "high",
-    ] = Field(
-        default="inherit",
-        description="Provider-independent agent reasoning level",
-    )
+        "xhigh",
+        "max",
+        "budget",
+    ] = f"inherit"
+    thinking_budget: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode=f"after")
+    def validate_thinking_budget(self):
+        """Keep effort and numeric budget settings mutually exclusive."""
+        if (self.thinking_level == f"budget") != (
+            self.thinking_budget is not None
+        ):
+            raise ValueError(f"Budget mode requires thinking_budget")
+        return self
+
     language: str = Field(
         default="zh",
         description="Language setting for this agent",
@@ -2345,6 +2568,10 @@ class AgentProfileConfig(BaseModel):
     coding_mode: CodingModeConfig = Field(
         default_factory=CodingModeConfig,
         description="Coding Mode configuration for this agent",
+    )
+    advisor_mode: AdvisorModeConfig = Field(
+        default_factory=AdvisorModeConfig,
+        description="Advisor Mode configuration for this agent",
     )
     mail: Optional[AgentMailConfig] = Field(
         default=None,
@@ -3113,6 +3340,47 @@ class BrowserConfig(BaseModel):
         return value
 
 
+class ThemeDarkConfig(BaseModel):
+    """Optional theme overrides used when the console is in dark mode."""
+
+    accent: Optional[str] = None
+    accent_bg: Optional[str] = None
+    surface: Optional[str] = None
+
+    @field_validator("accent", "accent_bg", "surface")
+    @classmethod
+    def _validate_color(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not _is_safe_css_color(value):
+            raise ValueError("must be a CSS color")
+        return value.strip() if value is not None else None
+
+
+class ThemeConfig(BaseModel):
+    """User-configurable Console appearance tokens."""
+
+    accent: Optional[str] = None
+    accent_hover: Optional[str] = None
+    accent_bg: Optional[str] = None
+    radius: Optional[str] = None
+    dark: Optional[ThemeDarkConfig] = None
+
+    @field_validator("accent", "accent_hover", "accent_bg")
+    @classmethod
+    def _validate_color(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None and not _is_safe_css_color(value):
+            raise ValueError("must be a CSS color")
+        return value.strip() if value is not None else None
+
+    @field_validator("radius")
+    @classmethod
+    def _validate_radius(cls, value: Optional[str]) -> Optional[str]:
+        if value is not None:
+            value = value.strip()
+            if not _CSS_RADIUS_RE.fullmatch(value):
+                raise ValueError("must be a pixel value or 0")
+        return value
+
+
 class Config(BaseModel):
     """Root config (config.json)."""
 
@@ -3125,6 +3393,7 @@ class Config(BaseModel):
     security: SecurityConfig = Field(default_factory=SecurityConfig)
     acp: ACPConfig = Field(default_factory=ACPConfig)
     browser: BrowserConfig = Field(default_factory=BrowserConfig)
+    theme: Optional[ThemeConfig] = None
     show_tool_details: bool = True
     user_timezone: str = Field(
         default_factory=detect_system_timezone,

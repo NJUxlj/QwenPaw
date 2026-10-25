@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 
+import pytest
 from fastapi import FastAPI
 
 import api.project_file_routes as project_file_routes
@@ -68,7 +70,7 @@ def _patch_payload(
     }
 
 
-def _pending_review(services, base):
+def _pending_review(services, base, *, interrupted_run_id="run-1"):
     candidate = base.project.model_dump(mode="json")
     candidate["name"] = "Review candidate"
     result = ProjectCommitBoundary(services.projects).commit(
@@ -79,7 +81,7 @@ def _pending_review(services, base):
         review_boundary=ReviewBoundary(
             request_message_seq=2,
             request_id="request-2",
-            interrupted_run_id="run-1",
+            interrupted_run_id=interrupted_run_id,
             accepted_generation=base.generation,
             accepted_etag=base.etag,
         ),
@@ -89,6 +91,135 @@ def _pending_review(services, base):
     )
     assert result.review is not None
     return result.review
+
+
+@pytest.mark.parametrize("already_selected", [False, True])
+@pytest.mark.parametrize("final_already_stale", [False, True])
+def test_video_selection_patch_accepts_history_and_only_invalidates_compose(
+    tmp_path,
+    run_scenario,
+    already_selected,
+    final_already_stale,
+):
+    from services.file_agent_runtime.work_graph import derive_work_graph
+
+    project = Project.new(project_id="project-1", name="Selected video")
+    document = project.model_dump(mode="json")
+    document["timelines"]["items"]["timeline:main"]["elements_by_id"] = {
+        "clip": {
+            "element_id": "clip",
+            "label": "Clip",
+            "span": {"start_tick": 0, "duration_tick": 4000},
+            "location": {},
+            "creation": {"type": "t2v", "video_prompt": "Current prompt"},
+            "outputs": {"main": {"slot_id": "element:clip:main"}},
+            "render_source": {
+                "type": "element_output",
+                "element_id": "clip",
+                "output_name": "main",
+            },
+        },
+    }
+    selected = "old" if already_selected else "new"
+    assets = document["assets"]
+    for kind, owner, slot_id, versions, current in (
+        (
+            "element_video",
+            "element:clip",
+            "element:clip:main",
+            ["old", "new"],
+            selected,
+        ),
+        (
+            "final_video",
+            "timeline:timeline:main",
+            "timeline:timeline:main:render",
+            ["final"],
+            "final",
+        ),
+    ):
+        assets["artifact_slots_by_id"][slot_id] = {
+            "slot_id": slot_id,
+            "kind": kind,
+            "owner_ref": owner,
+            "version_ids": versions,
+            "selected_version_id": current,
+        }
+        for version_id in versions:
+            checksum = hashlib.sha256(version_id.encode()).hexdigest()
+            assets["files_by_id"][version_id] = {
+                "file_id": version_id,
+                "kind": "artifact_payload",
+                "relative_uri": f"assets/{version_id}.mp4",
+                "sha256": checksum,
+                "size_bytes": len(version_id),
+                "media_type": "video/mp4",
+                "created_at": "2026-09-17T00:00:00Z",
+            }
+            assets["artifact_versions_by_id"][version_id] = {
+                "version_id": version_id,
+                "name": version_id,
+                "slot_id": slot_id,
+                "kind": kind,
+                "owner_ref": owner,
+                "file_id": version_id,
+                "checksum": checksum,
+                "based_on_generation": 0,
+                "stale": version_id == "old"
+                or (version_id == "final" and final_already_stale),
+                "stale_reason": "Old inputs" if version_id == "old" else None,
+                "created_at": "2026-09-17T00:00:00Z",
+            }
+
+    def initialize(root):
+        (root / "assets").mkdir(exist_ok=True)
+        for version_id in ("old", "new", "final"):
+            (root / f"assets/{version_id}.mp4").write_bytes(
+                version_id.encode(),
+            )
+
+    services = CreatorFileServices.create(tmp_path.resolve())
+    base = services.projects.create(
+        Project.model_validate(document),
+        initialize_staged_project=initialize,
+    )
+    app = FastAPI()
+    app.add_exception_handler(CreatorError, creator_error_handler)
+    app.include_router(router)
+    app.dependency_overrides[project_file_services] = lambda: services
+    payload = _patch_payload(
+        "choose-history",
+        "old",
+        base,
+        path=(
+            "/assets/artifact_slots_by_id/element:clip:main/"
+            "selected_version_id"
+        ),
+        expected=selected,
+    )
+
+    async def scenario(client):
+        return await client.patch(PROJECT_URL, json=payload)
+
+    response = run_scenario(app, scenario)
+    assert response.status_code == 200, response.text
+    saved = services.projects.read("project-1").project
+    assert (
+        saved.assets.artifact_slots_by_id[
+            "element:clip:main"
+        ].selected_version_id
+        == "old"
+    )
+    assert not saved.assets.artifact_versions_by_id["old"].stale
+    assert saved.assets.artifact_versions_by_id["final"].stale
+    graph = derive_work_graph(saved)
+    assert graph.by_id["video:clip"].status.value == "done"
+    assert graph.by_id["compose:timeline:main"].status.value == "ready"
+    assert not response.json()["editImpact"]["regenerationRequired"]
+    assert response.json()["editImpact"]["renderTimelineIds"] == [
+        "timeline:main",
+    ]
+    assert response.json()["editImpact"]["affectedElementIds"] == ["clip"]
 
 
 def _decisions_url(review):
@@ -235,11 +366,14 @@ def test_invalid_external_project_keeps_last_good_and_reports_sync_error(
     assert result.json()["lastGoodGeneration"] == 0
 
 
-def test_active_review_poll_is_created_only_from_review_boundary(
+def test_active_review_poll_reads_atomic_heads_while_project_writer_is_busy(
     tmp_path,
     run_scenario,
+    api_request,
 ) -> None:
     app, services, base = _app(tmp_path)
+    url = "/projects/project-1/runtime/reviews/active"
+    assert api_request(app, "GET", url).status_code == 204
     _pending_review(services, base)
 
     async def scenario(client):
@@ -250,7 +384,8 @@ def test_active_review_poll_is_created_only_from_review_boundary(
         )
         return first, second
 
-    first, second = run_scenario(app, scenario)
+    with services.projects.lifecycle_lock("project-1"):
+        first, second = run_scenario(app, scenario)
     assert first.status_code == 200
     reviews = first.json()
     assert isinstance(reviews, list) and len(reviews) == 1
@@ -398,11 +533,12 @@ def test_review_decision_replays_success_and_rejects_payload_drift(
     assert drift.json()["code"] == "CONFLICT"
 
 
-def test_rejection_feedback_appends_exactly_one_action_specific_message(
+def test_review_decision_appends_exactly_one_action_specific_message(
     tmp_path,
     run_scenario,
 ) -> None:
     for action, expected_role, expected_channel, expected_text in (
+        ("ACCEPT", "user", "agentdock", "用户已保留本轮创作修改"),
         ("UNDO_ONLY", "system", "runtime", "没有要求重做"),
         ("UNDO_AND_REGENERATE", "user", "agentdock", "明确要求重新生成"),
     ):
@@ -412,15 +548,21 @@ def test_rejection_feedback_appends_exactly_one_action_specific_message(
             session_id="session-1",
             conversation_id="conversation-1",
         )
-        review = _pending_review(services, base)
+        review = _pending_review(services, base, interrupted_run_id=None)
         payload = _decision_payload(
             review,
             f"decision-{action.lower()}",
-            decision="REJECT",
-            rejectionFeedback={
-                "action": action,
-                "feedbackNote": "人物状态不对；保持身份一致",
-            },
+            decision="ACCEPT" if action == "ACCEPT" else "REJECT",
+            **(
+                {}
+                if action == "ACCEPT"
+                else {
+                    "rejectionFeedback": {
+                        "action": action,
+                        "feedbackNote": "人物状态不对；保持身份一致",
+                    },
+                }
+            ),
         )
 
         first, replay = _decide_twice(
@@ -437,10 +579,15 @@ def test_rejection_feedback_appends_exactly_one_action_specific_message(
         assert len(messages) == 1
         assert messages[0].role == expected_role
         assert messages[0].channel.value == expected_channel
-        assert messages[0].source == "review_rejection_feedback"
+        assert messages[0].source == (
+            "review_approval_resume"
+            if action == "ACCEPT"
+            else "review_rejection_feedback"
+        )
         assert messages[0].content_parts[0].text is not None
         assert expected_text in messages[0].content_parts[0].text
-        assert "人物状态不对" in messages[0].content_parts[0].text
+        if action != "ACCEPT":
+            assert "人物状态不对" in messages[0].content_parts[0].text
 
 
 def test_rejection_feedback_requires_a_reject_decision(
@@ -514,6 +661,7 @@ def test_missing_project_writes_do_not_create_a_phantom_directory(
     app.dependency_overrides[project_file_services] = lambda: services
 
     async def scenario(client):
+        poll = await client.get("/projects/missing/runtime/reviews/active")
         patch = await client.patch(
             "/projects/missing/project",
             headers={"Idempotency-Key": "missing-patch"},
@@ -552,10 +700,10 @@ def test_missing_project_writes_do_not_create_a_phantom_directory(
                 ],
             },
         )
-        return patch, acquire, review
+        return poll, patch, acquire, review
 
     results = run_scenario(app, scenario)
-    assert [result.status_code for result in results] == [404] * 3
+    assert [result.status_code for result in results] == [404] * 4
     assert not (tmp_path / "missing").exists()
 
 

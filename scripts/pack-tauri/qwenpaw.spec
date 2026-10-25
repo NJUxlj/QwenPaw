@@ -63,6 +63,7 @@ _data_dirs = [
 datas = [
     (str(SRC / src), dst) for src, dst in _data_dirs if (SRC / src).is_dir()
 ]
+datas.append((str(REPO_ROOT / "plugins/hub"), "qwenpaw/plugins/bundled/hub"))
 datas += collect_tree(CONSOLE_DIST, "qwenpaw/console")
 datas.append(
     (
@@ -179,6 +180,11 @@ a = Analysis(
     binaries=[*qoder_binaries, *codex_binaries],
     datas=datas,
     hiddenimports=[
+        # Bundled Hub entrypoints are plugin data, not statically imported.
+        "qwenpaw.market.providers.qwenpaw",
+        "qwenpaw.market.providers.clawhub",
+        "qwenpaw.market.providers.modelscope",
+        "qwenpaw.market.providers.aliyun",
         "codex_cli_bin",
         # uvicorn internals (not auto-discovered by PyInstaller)
         "uvicorn.logging",
@@ -197,6 +203,11 @@ a = Analysis(
         *collect_submodules("qwenpawmail_mcp"),
         # All channel adapters (imported on-demand at runtime)
         *collect_submodules("qwenpaw.app.channels"),
+        # Console channel — required by qwenpaw.app.channels.registry but
+        # loaded via importlib.import_module(".console", ...), so PyInstaller
+        # cannot discover it. Without this entry the desktop bundle fails to
+        # start with ModuleNotFoundError on qwenpaw.app.channels.console.channel.
+        "qwenpaw.app.channels.console",
         # ACP runner support is lazily imported by delegate_external_agent.
         *collect_submodules("qwenpaw.agents.acp"),
         # PawApp SDK modules are imported by installed app plugins at runtime.
