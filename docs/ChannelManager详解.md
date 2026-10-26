@@ -1,780 +1,495 @@
-## `ChannelManager` 成员变量详解
+# ChannelManager 详解
 
+文档版本：QwenPaw v2.2.1  
+对照源码：`src/qwenpaw/`（包版本 `__version__` = `2.2.2b1`）  
+日期：2026-09-15
+
+本文对照当前源码说明 `ChannelManager` 与 **UnifiedQueueManager** 的职责划分。队列、worker、session 合并已从「每频道一条队列 + 固定 4 worker」迁到按 `(channel_id, session_id, priority_level)` 按需建队。
+
+相关源码：
+
+| 文件 | 职责 |
+|---|---|
+| `src/qwenpaw/app/channels/manager.py` | 频道生命周期、入队路由、批次合并、热替换 |
+| `src/qwenpaw/app/channels/unified_queue_manager.py` | 按 QueueKey 建队、按需 consumer、空闲回收 |
+| `src/qwenpaw/app/channels/command_registry.py` | 按查询文本判定优先级 |
+| `src/qwenpaw/app/channels/registry.py` | 内置 + 插件频道类注册表 |
+| `src/qwenpaw/app/channels/base.py` | `BaseChannel`：enqueue 回调、consume、debounce |
+| `src/qwenpaw/app/workspace/service_factories.py` | `ChannelManager.from_config` 的生产入口 |
+| `src/qwenpaw/app/workspace/workspace.py` | `start_all` / `stop_all` 挂到 ServiceManager |
+
+---
+
+## 1. 总览：状态在哪
+
+`ChannelManager` 仍是频道的所有者：创建、启动、停止、替换频道实例，并把平台回调接到统一队列。  
+**队列、consumer 任务、空闲清理不再挂在 ChannelManager 上**，全部在 `UnifiedQueueManager`。
+
+```
+状态仍在 ChannelManager
+  channels, _lock, _loop
+  _command_registry
+  _queue_manager          # 指向 UnifiedQueueManager，不自管队列
+  _workspace
+  _restart_locks
+  _enqueue_tasks, _start_tasks
+
+状态在 UnifiedQueueManager
+  _queues: QueueKey → QueueState
+  _lock, _cleanup_task, _running
+  每条队列的 asyncio.Queue + consumer Task
+  processed_count / last_activity
+
+状态在 BaseChannel（debounce，不在 Manager）
+  _no_text_debounce, _pending_content_by_session
+  _debounce_seconds, _debounce_pending, _debounce_timers
+  _enqueue 回调
+```
+
+### 已移除、不要对着旧文档找代码
+
+| 旧字段 / 常量 | 现状 |
+|---|---|
+| `self._queues: Dict[str, asyncio.Queue]` | **已移除**。迁至 `UnifiedQueueManager._queues`，key 不再是 `channel_id`，而是 `QueueKey` |
+| `self._consumer_tasks` | **已移除**。consumer 存在 `QueueState.consumer_task` |
+| `self._in_progress` | **已移除**。同一 QueueKey 只有一个 consumer，无需「处理中」集合 |
+| `self._pending` | **已移除**。处理中到达的消息直接进入该 QueueKey 的 `asyncio.Queue` |
+| `self._key_locks` | **已移除**。串行由「一 key 一 consumer」保证，不再按 session 加锁 drain |
+| `_CONSUMER_WORKERS_PER_CHANNEL = 4` | **已移除**。没有固定 worker 池；按需为每个 QueueKey 创建 **1** 个 consumer |
+| `ChannelManager._enqueue_one` 的 in_progress/pending 分支 | **已移除**。现职责是分类优先级并 `await _queue_manager.enqueue(...)` |
+| `ChannelManager._consume_channel_loop` | **已移除**。消费循环是 `ChannelManager._consume_queue`，由 UnifiedQueueManager 启动 |
+
+`_CHANNEL_QUEUE_MAXSIZE = 1000` **仍在** `manager.py`，但含义变了：是 **每个 QueueKey** 的 `asyncio.Queue(maxsize=1000)`，不是每个频道一条共享队列。
+
+---
+
+## 2. 端到端数据流
+
+```
+平台 SDK 回调（可能在非 asyncio 线程）
+        │
+        │  ch._enqueue(payload)   # set_enqueue 注入的闭包
+        ▼
+ChannelManager.enqueue(channel_id, payload)     # 线程安全
+        │  loop.call_soon_threadsafe(_enqueue_one)
+        ▼
+ChannelManager._enqueue_one                     # 必须在事件循环线程
+        │  query  = ch._extract_query_from_payload(payload)
+        │  prio   = CommandRegistry.get_priority_level(query)
+        │  sid    = _extract_session_id(ch, payload)
+        │  create_task(_enqueue_with_timeout(...))   # 超时 30s
+        ▼
+UnifiedQueueManager.enqueue(channel_id, session_id, priority, payload)
+        │  QueueKey = (channel_id, session_id, priority_level)
+        │  按需 _get_or_create_queue：Queue(maxsize=1000) + 1 consumer
+        │  await queue.put(payload)                  # 超时 30s
+        ▼
+ChannelManager._consume_queue(queue, channel_id, session_id, priority)
+        │  payload = await queue.get()
+        │  drain：get_nowait 抽空当前队列 → batch
+        │  _process_batch(ch, batch)  → merge → consume
+        ▼
+BaseChannel._consume_one_request 或 consume_one
+        │  no-text debounce / ACL / TaskTracker / process
+        ▼
+channel.send_event / send
+```
+
+同一会话、同一优先级：一条队列、一个 consumer，严格串行。  
+同一会话、不同优先级（例如 `/stop` = 0，普通消息 = 20）：**两条队列、两个 consumer，可并行**。  
+不同会话：彼此独立。
+
+---
+
+## 3. ChannelManager 成员变量
 
 ```python
 class ChannelManager:
-    """Owns queues and consumer loops; channels define how to consume via
-    consume_one(). Enqueue via enqueue(channel_id, payload) (thread-safe).
-    """
-
     def __init__(self, channels: List[BaseChannel]):
         self.channels = channels
         self._lock = asyncio.Lock()
-        self._queues: Dict[str, asyncio.Queue] = {}
-        self._consumer_tasks: List[asyncio.Task[None]] = []
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        # Session in progress: (channel_id, debounce_key) -> True while worker
-        # is processing. New payloads for that key go to _pending, merged
-        # when worker finishes.
-        self._in_progress: Set[Tuple[str, str]] = set()
-        self._pending: Dict[Tuple[str, str], List[Any]] = {}
-        # Per-key lock: same session is claimed by one worker for drain so
-        # [image1, text] are not split across workers (avoids no-text
-        # debounce reordering and duplicate content in AgentRequest).
 
-        '''
-        翻译：
-        # 按主键加锁：同一会话由单个工作线程独占处理以便排空
-        # 因此 [image1, text] 不会被拆分到不同工作线程（避免无文本时的防抖重排序，以及 AgentRequest 中出现重复内容）。
-        '''
-        self._key_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
+        # New unified queue system
+        self._command_registry = CommandRegistry()
+        self._queue_manager: UnifiedQueueManager | None = None
+        self._workspace = None
+
+        self._restart_locks: dict[str, asyncio.Lock] = {}
+        self._enqueue_tasks: set[asyncio.Task] = set()
+        self._start_tasks: set[asyncio.Task] = set()
 ```
 
+### 3.1 仍由 Manager 持有
 
+**`channels: List[BaseChannel]`**  
+当前进程里真正跑着的频道实例。`from_config` 只放入「注册表有类 + 环境允许 + `enabled=True`」的频道。`replace_channel` 会按 `ch.channel` 原地替换或 append。
 
-以下是 `ChannelManager` 类的所有成员变量及其含义：
+**`_lock: asyncio.Lock`**  
+保护 `self.channels` 的读快照 / 写替换。`get_channel`、`start_all` 快照、`stop_all` 快照、`replace_channel` 的 swap+stop 都用它。锁 **不** 保护 UnifiedQueueManager 内部字典。
 
-### 1. 核心数据
+**`_loop: Optional[asyncio.AbstractEventLoop]`**  
+`start_all()` 里 `asyncio.get_running_loop()`。`enqueue()` 依赖它做 `call_soon_threadsafe`。未 `start_all` 时入队会 warning 并丢弃。
 
-```python
-self.channels = channels
-```
-- **类型**: `List[BaseChannel]`
-- **含义**: 管理的通道列表，每个通道定义如何处理消息
+**`_command_registry: CommandRegistry`**  
+Manager 自己持有一份，用于入队时算 `priority_level`；`set_workspace` 时同样注入每个频道，供 `_consume_one_request` 识别控制命令（绕过 TaskTracker）。
 
-### 2. 异步控制
+**`_queue_manager: UnifiedQueueManager | None`**  
+`start_all` 创建，`stop_all` 里 `stop_all()` 后置 `None`。未初始化时 `_enqueue_one` 直接 return。
 
-```python
-self._lock = asyncio.Lock()
-```
-- **类型**: `asyncio.Lock`
-- **含义**: 全局锁，用于保护对共享状态的修改（如队列的创建）
+**`_workspace`**  
+`set_workspace(ws)` 写入。`restart_channel` 需要它拿 `agent_id` 读最新 `agent.json`；频道侧用它访问 TaskTracker / ChatManager。
 
-```python
-self._loop: Optional[asyncio.AbstractEventLoop] = None
-```
-- **类型**: `Optional[asyncio.AbstractEventLoop]`
-- **含义**: 事件循环引用，用于调度异步任务
+**`_restart_locks: dict[str, asyncio.Lock]`**  
+按频道名加锁，避免并发 `restart_channel` 造出两份 clone、丢掉其中一份。
 
-### 3. 消息队列
+**`_enqueue_tasks` / `_start_tasks`**  
+跟踪 `asyncio.create_task` 出来的入队协程和频道 `start()` 任务，供 `stop_all` 取消。`add_done_callback(...discard)` 做集合清理。
 
-```python
-self._queues: Dict[str, asyncio.Queue] = {}
-```
-- **类型**: `Dict[str, asyncio.Queue]`
-- **含义**: 按通道 ID 存储的消息队列字典
-- **key**: 通道 ID（如 `"discord"`, `"dingtalk"`, `"slack"`）
-- **value**: 该通道的 `asyncio.Queue` 实例
+### 3.2 工厂与注册
 
-### 4. 消费者任务
-
-```python
-self._consumer_tasks: List[asyncio.Task[None]] = []
-```
-- **类型**: `List[asyncio.Task[None]]`
-- **含义**: 存储所有消费者协程的任务对象
-- 用于管理消费者生命周期（如启动、取消）
-
-### 5. 去重/防抖机制（核心）
-
-```python
-self._in_progress: Set[Tuple[str, str]] = set()
-```
-- **类型**: `Set[Tuple[str, str]]`
-- **含义**: 记录正在处理的 (channel_id, key) 组合
-- **作用**: 当某个 key 正在处理时，新来的相同 key 消息会被放入 `_pending` 而不是立即处理
-- **示例**: `{("dingtalk", "session_123"), ("discord", "user_456")}`
-
-```python
-self._pending: Dict[Tuple[str, str], List[Any]] = {}
-```
-- **类型**: `Dict[Tuple[str, str], List[Any]]`
-- **含义**: 存储因防抖而暂存的消息
-- **key**: `(channel_id, key)` 元组
-- **value**: 等待合并处理的消息列表
-- **工作流程**: 处理完当前消息后，从 `_pending` 取出该 key 的消息，合并后放回队列
-
-### 6. 并发控制
-
-```python
-self._key_locks: Dict[Tuple[str, str], asyncio.Lock] = {}
-```
-- **类型**: `Dict[Tuple[str, str], asyncio.Lock]`
-- **含义**: 为每个 (channel_id, key) 组合提供独立的锁
-- **作用**: 
-  - 确保同一 key 的消息被串行处理（避免并发处理导致顺序混乱）
-  - 确保同一批次的消息（如图片+文本）被同一个 worker 完整处理
-- **示例**:
-  ```
-  {
-      ("dingtalk", "session_abc"): Lock(),  # 锁定 session_abc 的处理
-      ("discord", "user_123"): Lock(),      # 锁定 user_123 的处理
-  }
-  ```
-
-### 数据流关系图
+生产路径不是 `_app.py` 直接 `ChannelManager.from_config`，而是：
 
 ```
-                    ChannelManager
-┌──────────────────────────────────────────────────────────────┐
-│                                                              │
-│  channels: List[BaseChannel]                                 │
-│     │                                                        │
-│     ├── discord channel                                      │
-│     ├── dingtalk channel                                     │
-│     └── slack channel                                        │
-│                                                              │
-│  _queues: Dict[channel_id -> asyncio.Queue]                │
-│     │                                                        │
-│     ├── "discord"  ──► Queue[msg1, msg2, ...]               │
-│     ├── "dingtalk" ──► Queue[msg_a, msg_b, ...]             │
-│     └── "slack"   ──► Queue[...]                            │
-│                                                              │
-│  _consumer_tasks: List[Task]  ──► 4 workers per channel     │
-│                                                              │
-│  _in_progress: Set[(channel_id, key)]  ──► 记录正在处理的   │
-│     {("dingtalk", "session_1"), ("discord", "user_5")}      │
-│                                                              │
-│  _pending: Dict[(channel_id, key) -> List[msg]]            │
-│     {                                                        │
-│       ("dingtalk", "session_1"): [msg3, msg4],              │
-│       ("discord", "user_5"): [msg9]                         │
-│     }                                                        │
-│                                                              │
-│  _key_locks: Dict[(channel_id, key) -> Lock]               │
-│     {                                                        │
-│       ("dingtalk", "session_1"): Lock(),                    │
-│       ("discord", "user_5"): Lock()                         │
-│     }                                                        │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
-```
-
-### 处理流程示例
-
-```
-收到消息: DingTalk session_abc "hello"
-  │
-  ▼
-计算 key = "session_abc"
-  │
-  ▼
-检查 _in_progress 中是否有 ("dingtalk", "session_abc")
-  │
-  ├── 不在 → 放入 _queues["dingtalk"]，Worker 处理
-  │           └── 处理中: _in_progress.add(("dingtalk", "session_abc"))
-  │           └── 处理完: _in_progress.discard()
-  │                        从 _pending 取出 → 合并 → 放回队列
-  │
-  └── 已在 → 放入 _pending[("dingtalk", "session_abc")]
-```
-
-这些成员变量共同实现了一个**高效、并发安全、可去重的异步消息处理系统**。
-
-
-
-
-
-
-
-
-
-## `_enqueue_one` 函数详解
-
-
-```python
-def _enqueue_one(self, channel_id: str, payload: Any) -> None:
-        """Run on event loop: enqueue or append to pending if session in
-        progress.
-        """
-        q = self._queues.get(channel_id)
-        if not q:
-            logger.debug("enqueue: no queue for channel=%s", channel_id)
-            return
-        ch = next(
-            (c for c in self.channels if c.channel == channel_id),
-            None,
-        )
-        if not ch:
-            q.put_nowait(payload)
-            return
-        key = ch.get_debounce_key(payload)
-        if channel_id == "dingtalk" and isinstance(payload, dict):
-            logger.info(
-                "manager _enqueue_one dingtalk: key=%s in_progress=%s "
-                "payload_has_sw=%s -> %s",
-                key,
-                (channel_id, key) in self._in_progress,
-                bool(payload.get("session_webhook")),
-                "pending"
-                if (channel_id, key) in self._in_progress
-                else "queue",
+_app.py lifespan
+  → workspace_registry.start_all_configured_agents()
+    → Workspace.start()
+      → ServiceManager.start_all()
+        → create_channel_service()          # service_factories.py
+            ChannelManager.from_config(
+                process=ws.stream_query,
+                config=temp_config,         # 该 agent 的 channels + 全局 show_tool_details
+                on_last_dispatch=...,
+                workspace_dir=ws.workspace_dir,
             )
-        if (channel_id, key) in self._in_progress:
-            self._pending.setdefault((channel_id, key), []).append(payload)
-            return
-        q.put_nowait(payload)
-
+            cm.set_workspace(ws)
+        → ChannelManager.start_all()        # ServiceDescriptor.start_method
 ```
 
+`from_config` 要点（以源码为准）：
 
-这个函数是 **消息去重/防抖（debounce）机制** 的核心部分。它确保同一通道（channel）中具有相同 "debounce key" 的消息会被合并处理，避免重复处理。
+1. `get_available_channels()`：注册表全量，再被 `QWENPAW_ENABLED_CHANNELS` / `QWENPAW_DISABLED_CHANNELS` 过滤。
+2. `get_channel_registry()`：内置 `_BUILTIN_SPECS` + 插件 `PluginRegistry.get_registered_channels()`；插件 key 与内置冲突则跳过插件。
+3. 配置里该 key 缺失则跳过；`enabled` 为假则跳过。
+4. `inspect.signature(ch_cls.from_config)` 过滤 kwargs（`process` / `config` / `on_reply_sent` / `display_config` / `no_text_debounce` / `workspace_dir`）。构造失败只 warning，不影响其它频道。
+5. 内置 key 见 `registry.py` 的 `_BUILTIN_SPECS`：`imessage`, `discord`, `dingtalk`, `feishu`, `qq`, `telegram`, `mattermost`, `mqtt`, `console`, `matrix`, `slack`, `voice`, `sip`, `wecom`, `xiaoyi`, `yuanbao`, `wechat`, `onebot`。其中 `console` 是 required，加载失败会抛错。
 
-### 函数签名与基本逻辑
+`from_env` 仍存在（按环境变量构造），当前仓库内 **没有调用点**；运行时走 `from_config`。
 
-```python
-def _enqueue_one(self, channel_id: str, payload: Any) -> None:
-```
-
-### 逐步解析
-
-#### 1. 获取队列
-```python
-q = self._queues.get(channel_id)
-if not q:
-    logger.debug("enqueue: no queue for channel=%s", channel_id)
-    return
-```
-- 根据 `channel_id` 查找对应的 `asyncio.Queue`
-- 如果队列不存在，直接返回（可能该通道未启用）
-
-#### 2. 获取通道配置
-```python
-ch = next(
-    (c for c in self.channels if c.channel == channel_id),
-    None,
-)
-```
-- 从已注册的通道列表中找到对应的通道对象
-- 这个对象包含通道特定的配置和处理逻辑
-
-#### 3. 计算 debounce key
-```python
-key = ch.get_debounce_key(payload)
-```
-- **关键概念**：每个通道可以定义自己的 `get_debounce_key` 方法
-- 例如，对于 DingTalk 机器人，可能会使用 `session_webhook` 或用户 ID 作为 key
-- 相同 key 的消息被认为是"同一批次"，会被合并处理
-
-#### 4. 去重判断与pending队列
-```python
-if (channel_id, key) in self._in_progress:
-    self._pending.setdefault((channel_id, key), []).append(payload)
-    return
-q.put_nowait(payload)
-```
-- **`_in_progress`**：记录当前正在处理的 (channel_id, key) 组合
-- 如果该 key 正在处理中，将新消息放入 **`_pending`** 队列等待合并
-- 否则，直接放入队列等待消费
-
-### 整体设计模式
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     消息处理流程                             │
-├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  消息到达 ──→ 计算 debounce key ──→ 检查 _in_progress      │
-│                    │                      │                 │
-│                    │                      ▼                 │
-│                    │              是: 放入 _pending         │
-│                    │                      │                 │
-│                    └──────────┬───────────┘                 │
-│                               ▼                             │
-│                        否: 放入队列 q                        │
-│                               │                             │
-│                               ▼                             │
-│                    ┌─────────────────────┐                 │
-│                    │   消费者处理消息     │                 │
-│                    │   1. 取出同key消息   │                 │
-│                    │   2. 合并（如需要）  │                 │
-│                    │   3. 处理            │                 │
-│                    │   4. 从 _pending    │                 │
-│                    │      取出并处理      │                 │
-│                    └─────────────────────┘                 │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 使用场景
-
-这个机制主要解决以下问题：
-
-1. **消息风暴防护**：当短时间内收到大量相同类型的消息时，只处理第一条，后续的合并处理
-2. **会话一致性**：确保同一会话（相同 session_webhook）的消息按顺序处理
-3. **合并优化**：多条类似消息可以合并为一条，减少处理次数
-
-### 示例
-
-假设 DingTalk 通道收到 3 条消息：
-- 消息1: `{"session_webhook": "xxx", "text": "hello"}`
-- 消息2: `{"session_webhook": "xxx", "text": "world"}`  
-- 消息3: `{"session_webhook": "yyy", "text": "hi"}`
-
-处理流程：
-1. 消息1 到达 → key = "xxx" → 不在 `_in_progress` → 放入队列，开始处理
-2. 消息2 到达 → key = "xxx" → 在 `_in_progress` 中 → 放入 `_pending["xxx"]`
-3. 消息3 到达 → key = "yyy" → 不在 `_in_progress` → 放入队列
-
-最终消息1和消息2会被合并处理，消息3单独处理。
-
-
+`uses_manager_queue`（`BaseChannel` 默认 `True`）：为真才 `set_enqueue`。`voice`、`sip` 为 `False`（长连接自己跑循环），仍会 `start()` / `stop()`，但不进统一队列。
 
 ---
 
-
-     
-## `_consume_channel_loop` 函数详解
-
+## 4. UnifiedQueueManager 成员变量
 
 ```python
-async def _consume_channel_loop(
+QueueKey = Tuple[str, str, int]  # (channel_id, session_id, priority_level)
+
+@dataclass
+class QueueState:
+    queue: asyncio.Queue
+    consumer_task: asyncio.Task[None]
+    created_at: float
+    last_activity: float
+    processed_count: int = 0
+
+class UnifiedQueueManager:
+    def __init__(
         self,
-        channel_id: str,
-        worker_index: int,
-    ) -> None:
-        """
-        Run one consumer worker: pop payload, drain queue of same session,
-        mark session in progress, merge batch (native or requests), process
-        once, then flush any pending for this session (merged) back to queue.
-        Multiple workers per channel allow different sessions in parallel.
-
-        启动一个消费工作线程：弹出负载，排空同一会话的队列，将会话标记为处理中，合并批次（原生请求或普通请求），执行一次处理，然后将该会话所有待处理的合并数据重新写回队列。每个通道支持多个工作线程，可并行处理不同会话。
-        """
-        q = self._queues.get(channel_id)
-        if not q:
-            return
-        while True:
-            try:
-                payload = await q.get()
-                ch = await self.get_channel(channel_id)
-                if not ch:
-                    continue
-                key = ch.get_debounce_key(payload)
-                key_lock = self._key_locks.setdefault(
-                    (channel_id, key),
-                    asyncio.Lock(),
-                )
-                async with key_lock:
-                    self._in_progress.add((channel_id, key))
-                    batch = _drain_same_key(q, ch, key, payload)
-                try:
-                    await _process_batch(ch, batch)
-                finally:
-                    self._in_progress.discard((channel_id, key))
-                    pending = self._pending.pop((channel_id, key), [])
-                    _put_pending_merged(ch, q, pending)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                logger.exception(
-                    "channel consume_one failed: channel=%s worker=%s",
-                    channel_id,
-                    worker_index,
-                )
-
-
+        consumer_fn: ConsumerFn,
+        queue_maxsize: int = 1000,
+        idle_timeout: float = 600.0,   # 10 minutes
+        cleanup_interval: float = 60.0,  # 1 minute
+    ):
+        self._consumer_fn = consumer_fn
+        self._queue_maxsize = queue_maxsize
+        self._idle_timeout = idle_timeout
+        self._cleanup_interval = cleanup_interval
+        self._queues: Dict[QueueKey, QueueState] = {}
+        self._lock = asyncio.Lock()
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._running = False
 ```
 
-
-
-这是一个 **异步消费者工作循环**，是消息处理管道的核心。它从队列中取出消息、批量处理相同 key 的消息、处理完成后刷新 pending 队列。
-
-### 函数结构概览
+`ChannelManager.start_all` 的构造调用是：
 
 ```python
-async def _consume_channel_loop(
-    self,
-    channel_id: str,
-    worker_index: int,
-) -> None:
-```
-
-### 逐步解析
-
-#### 1. 获取队列
-```python
-q = self._queues.get(channel_id)
-if not q:
-    return
-```
-- 根据 `channel_id` 获取对应的消息队列
-- 如果队列不存在则退出（通道可能未启用）
-
-#### 2. 主循环：持续消费消息
-```python
-while True:
-    try:
-        payload = await q.get()
-```
-- 阻塞等待直到队列中有消息可用
-- `q.get()` 会阻塞，这是消费者的核心循环
-
-#### 3. 获取通道和处理 key
-```python
-ch = await self.get_channel(channel_id)
-if not ch:
-    continue
-
-key = ch.get_debounce_key(payload)
-```
-- 异步获取通道实例
-- 计算当前消息的 debounce key（用于分组）
-
-#### 4. 关键：使用锁保护同一 key 的处理
-```python
-key_lock = self._key_locks.setdefault(
-    (channel_id, key),
-    asyncio.Lock(),
+self._queue_manager = UnifiedQueueManager(
+    consumer_fn=self._consume_queue,
+    queue_maxsize=_CHANNEL_QUEUE_MAXSIZE,  # 1000
 )
-async with key_lock:
-    self._in_progress.add((channel_id, key))
-    batch = _drain_same_key(q, ch, key, payload)
 ```
 
-这是**并发安全**的关键：
-- **`_key_locks`**：一个字典，为每个 (channel_id, key) 组合维护一个 `asyncio.Lock`
-- **为什么需要锁**：多个消费者 worker 可能同时处理不同 key（session_id），但同一 key 需要串行处理
-- **`_drain_same_key`**：取出队列中所有具有相同 key 的消息，形成一个批次
+未改 `idle_timeout` / `cleanup_interval`，因此默认 **空闲 600s 且队列为空则回收**，清理循环 **每 60s** 跑一次。
 
-#### 5. 处理批次
-```python
-try:
-    await _process_batch(ch, batch)
-finally:
-    self._in_progress.discard((channel_id, key))
-    pending = self._pending.pop((channel_id, key), [])
-    _put_pending_merged(ch, q, pending)
-```
+| 成员 | 含义 |
+|---|---|
+| `_consumer_fn` | 即 `ChannelManager._consume_queue` |
+| `_queue_maxsize` | 每条 QueueKey 队列容量，满则 `put` 阻塞，最多等 30s |
+| `_queues` | 活着的队列；consumer 退出或 idle cleanup 会 `pop` |
+| `_lock` | 保护 `_queues` 字典本身，不是 payload 处理锁 |
+| `_cleanup_task` | 后台 `_cleanup_idle_queues` |
+| `_running` | `start_cleanup_loop` 置 True，`stop_all` 置 False |
 
-处理流程：
-1. **标记处理中**：将 `(channel_id, key)` 加入 `_in_progress`
-2. **处理批次**：调用 `_process_batch(ch, batch)` 进行实际处理
-   - 如果有多条消息且是 native payload，会合并成一条
-3. **finally 块**（确保执行）：
-   - 从 `_in_progress` 中移除，表示处理完成
-   - 从 `_pending` 中取出该 key 对应的所有待处理消息
-   - 调用 `_put_pending_merged` 合并后放回队列
-
-#### 6. 异常处理
-```python
-except asyncio.CancelledError:
-    break
-except Exception:
-    logger.exception(
-        "channel consume_one failed: channel=%s worker=%s",
-        channel_id,
-        worker_index,
-    )
-```
-- `CancelledError`：优雅退出
-- 其他异常：记录日志但继续处理下一个消息（不会因为单个消息失败而崩溃）
-
-### 整体数据流
-
-```
-                    ┌─────────────────┐
-                    │   消息队列 q     │
-                    └────────┬────────┘
-                             │
-                             ▼  q.get()
-                    ┌─────────────────┐
-                    │  获取 debounce  │
-                    │      key         │
-                    └────────┬────────┘
-                             │
-                             ▼ key_lock
-                    ┌─────────────────┐
-                    │ _in_progress    │◄── 添加 (channel_id, key)
-                    │ 添加到集合       │
-                    └────────┬────────┘
-                             │
-                             ▼ _drain_same_key
-                    ┌─────────────────┐
-                    │  取出同 key 的   │
-                    │  所有消息 batch │
-                    └────────┬────────┘
-                             │
-                             ▼ _process_batch
-                    ┌─────────────────┐
-                    │   合并（如需）   │
-                    │   处理消息       │
-                    └────────┬────────┘
-                             │
-                             ▼ finally 块
-                    ┌─────────────────┐
-                    │ _in_progress    │──► 移除 (channel_id, key)
-                    │ _pending 取出   │
-                    │ 合并后放回队列   │
-                    └─────────────────┘
-```
-
-### 并发模型设计
-
-```
-通道: dingtalk
-
-Worker 0: 处理 key="session_a" ──┐
-Worker 1: 处理 key="session_b" ──┼── 不同 key 并行处理
-Worker 2: 处理 key="session_c" ──┤
-Worker 3: 空闲等待               │
-
-_key_locks = {
-    ("dingtalk", "session_a"): Lock(),
-    ("dingtalk", "session_b"): Lock(),
-    ("dingtalk", "session_c"): Lock(),
-}
-```
-
-- **每个通道有多个 worker**（默认 4 个）
-- **相同 key 串行**：通过锁确保同一 key 的消息不会并发处理
-- **不同 key 并行**：不同 key 可以被不同 worker 并行处理，提高吞吐量
-
-### 总结
-
-这个函数实现了：
-1. **消息去重**：相同 key 的消息批量处理
-2. **并发控制**：通过锁机制保证同一会话串行处理
-3. **优雅退出**：支持取消和异常恢复
-4. **_pending 刷新**：处理完成后自动处理积压的消息
-
-
-
-
+`QueueState.last_activity` 在 enqueue 成功路径、以及 `increment_processed` 后更新。idle 判定：`queue.empty()` **且** `now - last_activity > idle_timeout`。
 
 ---
 
+## 5. 优先级：CommandRegistry
 
-
-
-## `start_all` 方法详解
-
+入队前 Manager 抽 query，再问 registry：
 
 ```python
-
-async def start_all(self) -> None:
-    self._loop = asyncio.get_running_loop()
-    async with self._lock:
-        snapshot = list(self.channels)
-    for ch in snapshot:
-        if getattr(ch, "uses_manager_queue", True):
-            self._queues[ch.channel] = asyncio.Queue(
-                maxsize=_CHANNEL_QUEUE_MAXSIZE,
-            )
-            ch.set_enqueue(self._make_enqueue_cb(ch.channel))
-    for ch in snapshot:
-        if ch.channel in self._queues:
-            for w in range(_CONSUMER_WORKERS_PER_CHANNEL):
-                task = asyncio.create_task(
-                    self._consume_channel_loop(ch.channel, w),
-                    name=f"channel_consumer_{ch.channel}_{w}",
-                )
-                self._consumer_tasks.append(task)
-    logger.debug(
-        "starting channels=%s queues=%s",
-        [g.channel for g in snapshot],
-        list(self._queues.keys()),
-    )
-    for g in snapshot:
-        try:
-            await g.start()
-        except Exception:
-            logger.exception(f"failed to start channels={g.channel}")
-
-```
-     
-
-这是 `ChannelManager` 的启动方法，负责初始化所有通道的队列、消费者任务和通道本身。
-
-### 完整代码结构
-
-```python
-async def start_all(self) -> None:
-    # 步骤 1: 获取事件循环
-    self._loop = asyncio.get_running_loop()
-    
-    # 步骤 2: 线程安全地获取通道快照
-    async with self._lock:
-        snapshot = list(self.channels)
-    
-    # 步骤 3: 为每个通道创建队列并设置入队回调
-    for ch in snapshot:
-        if getattr(ch, "uses_manager_queue", True):
-            self._queues[ch.channel] = asyncio.Queue(
-                maxsize=_CHANNEL_QUEUE_MAXSIZE,
-            )
-            ch.set_enqueue(self._make_enqueue_cb(ch.channel))
-    
-    # 步骤 4: 为每个通道创建消费者 worker 任务
-    for ch in snapshot:
-        if ch.channel in self._queues:
-            for w in range(_CONSUMER_WORKERS_PER_CHANNEL):
-                task = asyncio.create_task(
-                    self._consume_channel_loop(ch.channel, w),
-                    name=f"channel_consumer_{ch.channel}_{w}",
-                )
-                self._consumer_tasks.append(task)
-    
-    # 步骤 5: 启动每个通道
-    for g in snapshot:
-        try:
-            await g.start()
-        except Exception:
-            logger.exception(f"failed to start channels={g.channel}")
+query = ch._extract_query_from_payload(payload)
+priority_level = self._command_registry.get_priority_level(query)
 ```
 
-### 逐步解析
+默认档位（数字越小越优先）：
 
-#### 步骤 1: 获取事件循环
+| level | 名称 | 默认注册 |
+|---|---|---|
+| 0 | critical | `/stop` |
+| 10 | high | `/daemon ...` 及短别名 `/status` `/restart` `/logs` `/approve` `/deny` `/approval` 等 |
+| 20 | normal | **缺省**（普通聊天、`/compact` `/new` 等未注册命令） |
+| 30 | low | 预留，默认未挂命令 |
 
-```python
-self._loop = asyncio.get_running_loop()
-```
-- 获取当前正在运行的事件循环引用
-- 用于后续可能的调度操作
+匹配规则：query 必须以 `/` 开头；按 **最长前缀** 匹配，其后必须是结尾或空白，因此 `/stopx`、`/statusx` 落到 20。
 
-#### 步骤 2: 线程安全地获取通道快照
+`/stop` 处理里会 `channel_manager.clear_queue(channel_id, session_id, 20)`，只清 **normal(20)** 队列，不清 priority 0 自己那条。
 
-```python
-async with self._lock:
-    snapshot = list(self.channels)
-```
-- 使用 `_lock` 保护，确保在多线程环境下安全读取 `self.channels`
-- 创建通道列表的快照，避免在后续遍历过程中通道列表被修改
+---
 
-#### 步骤 3: 创建队列并注册回调
+## 6. enqueue：线程安全路径
 
-```python
-for ch in snapshot:
-    if getattr(ch, "uses_manager_queue", True):
-        self._queues[ch.channel] = asyncio.Queue(
-            maxsize=_CHANNEL_QUEUE_MAXSIZE,
-        )
-        ch.set_enqueue(self._make_enqueue_cb(ch.channel))
-```
+### 6.1 频道侧回调
 
-- **检查 `uses_manager_queue`**：有些通道可能不使用 Manager 的队列（如自定义队列实现）
-- **创建队列**：为每个通道创建 `asyncio.Queue`，最大容量为 `_CHANNEL_QUEUE_MAXSIZE`（1000）
-- **设置入队回调**：通过 `ch.set_enqueue()` 注册回调，当通道收到消息时会调用此回调
-
-回调的创建：
+`start_all` / `replace_channel` 对 `uses_manager_queue=True` 的频道：
 
 ```python
 def _make_enqueue_cb(self, channel_id: str) -> Callable[[Any], None]:
     def cb(payload: Any) -> None:
         self.enqueue(channel_id, payload)
     return cb
-```
-- 返回一个闭包，将通道收到的 payload 传递给 `self.enqueue()`
 
-#### 步骤 4: 启动消费者 Worker
-
-```python
-for ch in snapshot:
-    if ch.channel in self._queues:
-        for w in range(_CONSUMER_WORKERS_PER_CHANNEL):
-            task = asyncio.create_task(
-                self._consume_channel_loop(ch.channel, w),
-                name=f"channel_consumer_{ch.channel}_{w}",
-            )
-            self._consumer_tasks.append(task)
+ch.set_enqueue(self._make_enqueue_cb(ch.channel))
 ```
 
-- **每个通道 4 个 Worker**：`_CONSUMER_WORKERS_PER_CHANNEL = 4`
-- **创建异步任务**：为每个 worker 创建一个独立的任务
-- **任务命名**：便于调试，如 `channel_consumer_dingtalk_0`, `channel_consumer_dingtalk_1` 等
-- **存储任务**：将所有任务添加到 `_consumer_tasks` 列表
+平台线程（钉钉 Stream 等）调用 `self._enqueue(payload)` 或自己再包一层 `call_soon_threadsafe`。钉钉 handler 已对回调做了一次 `call_soon_threadsafe`；`ChannelManager.enqueue` 还会再做一次，最终 `_enqueue_one` 仍在主 loop 上执行。
 
-#### 步骤 5: 启动通道本身
+### 6.2 `enqueue`（可从任意线程调用）
 
 ```python
-for g in snapshot:
+def enqueue(self, channel_id: str, payload: Any) -> None:
+    if self._loop is None:
+        logger.warning("enqueue: loop not set ...")
+        return
+    self._loop.call_soon_threadsafe(
+        self._enqueue_one,
+        channel_id,
+        payload,
+    )
+```
+
+这是线程安全边界：同步 SDK 不得直接 `await` 队列。必须先 `start_all()`，否则 `_loop` 为空。
+
+### 6.3 `_enqueue_one`（事件循环线程，同步函数）
+
+不再检查 `_in_progress` / `_pending`。步骤：
+
+1. `_queue_manager is None` → warning，丢弃。
+2. 按 `c.channel == channel_id` 找频道；找不到 → warning，丢弃（旧实现这里会 `put_nowait` 到频道队列；新实现没有按频道的共享队列，无法投递）。
+3. `query` / `priority_level` / `session_id`。
+4. `asyncio.create_task(_enqueue_with_timeout(...))` 记入 `_enqueue_tasks`。
+
+`session_id` 提取：payload 已有 `session_id` 则用之，否则 `ch.get_debounce_key(payload)`（与频道 session 隔离同一套逻辑）。
+
+### 6.4 `_enqueue_with_timeout` + `UnifiedQueueManager.enqueue`
+
+Manager 外包 `asyncio.wait_for(..., timeout=30.0)`。  
+`TimeoutError` 在 Manager 里是 **`pass`（无日志）**；`CancelledError` 再抛出；其它异常 `logger.exception`。
+
+UnifiedQueueManager 内部：
+
+1. `_get_or_create_queue`：没有则 `asyncio.Queue(maxsize=1000)` + `create_task(_run_consumer)`，名字形如 `consumer_{channel}_{session[:20]}_{priority}`。
+2. 更新 `last_activity`。
+3. `await asyncio.wait_for(state.queue.put(payload), timeout=30.0)`；超时打 warning（含 `qsize`）再 **raise**，由外层 wait_for 吃掉。
+
+两层 30s：外层包整个 enqueue（含建队），内层只包 `put`。队列满时 `put` 阻塞直到有空位或超时。
+
+---
+
+## 7. worker / drain / session 合并
+
+### 7.1 谁在跑循环
+
+`UnifiedQueueManager._run_consumer` 只做：调用 `consumer_fn` → 退出时从 `_queues` pop 该 key。真正的 `while True` 在 `ChannelManager._consume_queue`。
+
+**没有「每频道 4 个 worker」。** 并发度 = 当前活着的 QueueKey 数量。同一 key 永远只有一个 consumer。
+
+### 7.2 `_consume_queue` drain
+
+```python
+payload = await queue.get()
+ch = await self.get_channel(channel_id)   # 每次重取，配合 replace_channel
+# 找不到则 0.5s × 3 次重试；仍无则 logger.error 并 return（该 consumer 结束）
+
+batch = [payload]
+while True:
     try:
-        await g.start()
-    except Exception:
-        logger.exception(f"failed to start channels={g.channel}")
+        batch.append(queue.get_nowait())
+    except asyncio.QueueEmpty:
+        break
+
+await _process_batch(ch, batch)
+await self._queue_manager.increment_processed(..., count=len(batch))
 ```
 
-- 调用每个通道的 `start()` 方法
-- 可能是启动 Webhook 服务器、连接 WebSocket 等
-- 捕获异常确保一个通道启动失败不影响其他通道
+drain 不再按 debounce key 过滤：这条队列里的消息 **已经** 是同一 `(channel, session, priority)`。drain 只合并「已经排队、尚未 get」的连发（如图片紧跟文本）。处理期间新入队的消息留在队列里，本轮 `_process_batch` 结束后下一轮再取——这替代了旧的 `_pending` 回灌。
 
-### 启动流程图
+`CancelledError`：break 退出。其它异常：打日志，**继续循环**（单条失败不杀 consumer）。
 
-```
-                    start_all() 执行流程
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  1. 获取事件循环                                             │
-│     self._loop = get_running_loop()                         │
-│                                                             │
-│  2. 快照 channels                                           │
-│     snapshot = [discord, dingtalk, slack]                   │
-│                                                             │
-│  3. 创建队列 + 注册回调                                      │
-│     ┌─────────────┐  ┌─────────────┐  ┌─────────────┐      │
-│     │  discord    │  │  dingtalk   │  │   slack     │      │
-│     │  Queue(1000)│  │  Queue(1000)│  │  Queue(1000)│      │
-│     └──────┬──────┘  └──────┬──────┘  └──────┬──────┘      │
-│            │                │                │             │
-│            ▼                ▼                ▼             │
-│     ┌─────────────┐  ┌─────────────┐  ┌─────────────┐      │
-│     │set_enqueue()│  │set_enqueue()│  │set_enqueue()│      │
-│     └─────────────┘  └─────────────┘  └─────────────┘      │
-│                                                             │
-│  4. 启动消费者 Workers                                      │
-│     ┌─────────────────────────────────────────┐           │
-│     │  discord:  [Worker0, Worker1, W2, W3]   │           │
-│     │  dingtalk: [Worker0, Worker1, W2, W3]   │           │
-│     │  slack:   [Worker0, Worker1, W2, W3]   │           │
-│     └─────────────────────────────────────────┘           │
-│                                                             │
-│  5. 启动通道                                                │
-│     await discord.start()                                  │
-│     await dingtalk.start()                                 │
-│     await slack.start()                                    │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+### 7.3 `_process_batch`
+
+```python
+async def _process_batch(ch: BaseChannel, batch: List[Any]) -> None:
+    if len(batch) > 1 and ch._is_native_payload(batch[0]):
+        merged = ch.merge_native_items(batch)
+        await ch._consume_one_request(merged)
+    elif len(batch) > 1:
+        merged = ch.merge_requests(batch)
+        if merged is not None:
+            await ch._consume_one_request(merged)
+        else:
+            await ch.consume_one(batch[0])
+    elif ch._is_native_payload(batch[0]):
+        await ch._consume_one_request(batch[0])
+    else:
+        await ch.consume_one(batch[0])
 ```
 
-### 启动完成后的状态
+`_is_native_payload`：`dict` 且含 `content_parts`。  
+native 合并走 `merge_native_items`（默认拼 `content_parts`、合并部分 meta）；非 native 走 `merge_requests`（拼 `input[0].content`）。钉钉有额外 merge 日志。
+
+注意：native 路径（含单条）走 `_consume_one_request`，**绕过** `consume_one`。因此 `BaseChannel.consume_one` 里 `_debounce_seconds > 0` 的时间窗合并，对 Manager 投递的 native payload **不会触发**。时间窗 debounce 只在有人直接调用 `consume_one` 且 payload 为 native 时生效。当前 `dingtalk` 把 `_debounce_seconds` 设为 `0.0`。
+
+无文本防抖在 `_consume_one_request` → `_debounce_payload` → `_apply_no_text_debounce`，责任在 **频道**，不在 Manager。
+
+---
+
+## 8. start / stop
+
+### 8.1 `start_all`
 
 ```
-ChannelManager 启动后
-┌─────────────────────────────────────────────────────────────┐
-│                                                             │
-│  _queues:                                                   │
-│    "discord"  ──► Queue ◄────── Workers[0,1,2,3] 消费      │
-│    "dingtalk" ──► Queue ◄────── Workers[0,1,2,3] 消费      │
-│    "slack"   ──► Queue ◄────── Workers[0,1,2,3] 消费      │
-│                                                             │
-│  _consumer_tasks:                                          │
-│    [Task(channel_consumer_discord_0),                      │
-│     Task(channel_consumer_discord_1),                      │
-│     Task(channel_consumer_discord_2),                      │
-│     Task(channel_consumer_discord_3),                      │
-│     Task(channel_consumer_dingtalk_0),                     │
-│     ...]                                                    │
-│                                                             │
-│  通道 Web 服务:                                             │
-│    - Discord: Webhook 接收消息                             │
-│    - DingTalk: Webhook 接收消息                             │
-│    - Slack:   WebSocket 连接                                │
-│                                                             │
-└─────────────────────────────────────────────────────────────┘
+1. self._loop = get_running_loop()
+2. 构造 UnifiedQueueManager(consumer_fn=_consume_queue, maxsize=1000)
+3. start_cleanup_loop()          # 后台 idle 回收
+4. 锁内 snapshot = list(channels)
+5. uses_manager_queue 的频道 set_enqueue(...)
+6. 每个频道 create_task(_start_channel(g))  # fire-and-forget，不 await start()
 ```
 
-### 消息流转完整路径
+与旧实现差异：
+
+- **不再** 按频道创建 `asyncio.Queue`，也 **不再** 启动 `channel_consumer_{ch}_{0..3}`。
+- 频道 `start()` 改为后台任务（避免 WebSocket 握手堵住整个 Workspace 启动）。失败只记 exception 日志。
+- 第一条消息到来时才建 Queue + consumer。
+
+### 8.2 `stop_all`
+
+顺序（源码原样）：
+
+1. 取消 `_start_tasks`，`wait` 最多 3s。
+2. 取消 `_enqueue_tasks`，`wait` 最多 2s；超时 warning。
+3. `await _queue_manager.stop_all()`：停 cleanup；cancel 全部 consumer，wait 最多 5s；`_queues.clear()`；然后 Manager 把 `_queue_manager = None`。
+4. 频道 `set_enqueue(None)`。
+5. **逆序** `gather` 各频道 `stop()`。
+
+---
+
+## 9. 热重载与单频道重启
+
+ChannelManager **没有** 旧式「改完 config 在 Manager 内重建 `_queues`」的逻辑。现有两条路径：
+
+### 9.1 单频道重启（Manager 原地替换）
+
+HTTP `POST .../channels/{channel_name}/restart` → `restart_channel`：
+
+1. 取 `_restart_locks[channel_name]`。
+2. 必须已 `set_workspace`（否则 `RuntimeError`）。
+3. `load_agent_config(agent_id)` 读该频道最新配置。
+4. `channel_instance.clone(config)` → `from_config` 新实例，再 `set_workspace`。
+5. `replace_channel(new_channel)`：
+   - 先 `set_enqueue` + `await new.start()`（在 `_lock` 外，启动失败会 `stop` 新实例再 raise）。
+   - 锁内按名字 swap 或 append，再 `stop` 旧实例。
+
+`replace_channel` **不** 重建 UnifiedQueue。注释写明 queue/consumer 仍按需创建。`_consume_queue` 每轮 `get_channel`，swap 后下一轮用新实例。swap 窗口频道暂时找不到时，最多重试 1.5s，失败则该 QueueKey 的 consumer 退出。
+
+### 9.2 Agent 级热重载（重建整个 Workspace，含新的 ChannelManager）
+
+- 前端/API 改配置后 `schedule_agent_reload` → `MultiAgentManager.reload_agent`。
+- `AgentConfigWatcher` 轮询该 agent 的 `agent.json`（默认 2s）。`channels` 或 `heartbeat` hash 变化时同样走 `reload_agent`。
+
+这是 **换 Workspace**，不是在现有 `ChannelManager` 上改 `_queues`。旧 Manager 走 `stop_all`，新 Manager 再 `from_config` + `start_all`。
+
+---
+
+## 10. 与 BaseChannel 的协作
+
+| 方向 | 约定 |
+|---|---|
+| Manager → Channel | `set_enqueue(cb)` / `None`；`start()` / `stop()`；`clone`；`health_check`；`send_event` / `send_content_parts` |
+| Channel → Manager | 收到平台消息后调用 `_enqueue(payload)`（线程安全由 Manager.enqueue 保证） |
+| Manager 消费 | native：`_consume_one_request`；非 native 单条：`consume_one` |
+| Channel 必须提供 | `channel` 名、`from_config`、`get_debounce_key` / `resolve_session_id`、`_extract_query_from_payload`、`merge_native_items` / `merge_requests` |
+| debounce 边界 | **session 隔离 + 队列 drain 合并**：Manager/UnifiedQueue；**无文本缓冲、时间窗**：Channel |
+
+`get_debounce_key` 默认：dict 用 `session_id` 或 `resolve_session_id(sender_id, meta)`（默认 `"{channel}:{sender_id}"`）。钉钉等可 override。
+
+`send_event` / `send_text`：Manager 按频道名查找，补 `session_id` / `user_id` / `bot_prefix` 后交给频道。定时任务纯文本走 `send_text`。
+
+`set_workspace(workspace)`：Manager 保存引用，并对每个频道 `ch.set_workspace(workspace, self._command_registry)`。
+
+---
+
+## 11. 处理过程示例（对照旧 pending 模型）
+
+钉钉同一 `session_id` 连续三条普通消息（priority=20），另有一条 `/stop`（priority=0）：
 
 ```
-外部消息 ──► 通道 Web 服务 ──► set_enqueue() 回调
-                              │
-                              ▼
-                        self.enqueue()
-                              │
-                              ▼
-                        _enqueue_one() ──► _queues[channel]
-                                              │
-                                              ▼
-                                    消费者 Worker 取出处理
+msg1 "hello"     → 创建 QueueKey=(dingtalk, sid, 20)，consumer 开始处理
+msg2 "world"     → 若 msg1 仍在 _process_batch：msg2 进同一队列，本轮 drain
+                   若已开始处理且队列已空：msg2 等下一轮，不再进 Manager._pending
+msg3 /stop       → QueueKey=(dingtalk, sid, 0) 另一条队列，可与 20 并行
+                   （/stop 随后 clear_queue(..., 20) 丢掉未处理的普通消息）
 ```
+
+旧模型：msg1 处理中时 msg2 进 `_pending`，finally 再 merge 放回频道队列。  
+新模型：msg2 始终进同一 `asyncio.Queue`；drain 能合并的当场合并，合并窗口之外的下轮处理。
+
+---
+
+## 12. 其它 API（Manager 薄封装）
+
+| 方法 | 行为 |
+|---|---|
+| `get_channel(name)` | 锁内线性查找 |
+| `get_channel_health(name)` | 调 `health_check()`，异常则返回 `unhealthy` dict；频道不存在 `KeyError` |
+| `clear_queue(ch, sid, prio)` | 转 `_queue_manager.clear_queue`，`get_nowait` 抽空；manager 未启动返回 0 |
+| `get_metrics` | **只在 UnifiedQueueManager**；ChannelManager **没有** 转发 |
+
+---
+
+## 13. 相对旧实现的关键变化
+
+1. **队列维度**：从「每频道 1 条 Queue、固定 4 worker」变为「每 `(channel, session, priority)` 1 条 Queue、1 个按需 consumer」。
+2. **maxsize=1000**：仍是 `asyncio.Queue` 上限，但是 **每个 QueueKey**，不是每个频道共享 1000。
+3. **session 串行**：不再靠 `_key_locks` + `_in_progress`；同一 QueueKey 天然单消费者。
+4. **`_pending` 回灌取消**：处理中到达的消息直接 `queue.put`；drain 只合并当前积压。
+5. **优先级队列**：`/stop` 等控制命令可与普通会话并行，并可 `clear_queue` 丢掉普通积压。
+6. **debounce 下沉**：无文本 / 时间窗在 `BaseChannel`；Manager 只做优先级路由 + 同 QueueKey 批次 merge。
+7. **启动**：不再预创建频道队列和 4N 个 consumer；`start()` 后台化；第一条消息才建队。
+8. **空闲回收**：空队列且 600s 无活动则 cancel consumer（每 60s 扫描）。
+9. **热重载**：单频道 `replace_channel` 不拆队列；配置级变更走 Workspace/`reload_agent` 整实例替换。
+10. **入队失败语义**：频道找不到或 queue_manager 未就绪则丢消息并打日志，不再写入「频道级」队列。
+)

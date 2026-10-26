@@ -1,6 +1,8 @@
-# CoPaw 项目架构文档
+# QwenPaw 项目架构文档
 
-> 版本：基于当前代码库分析生成 | 日期：2026-03-02
+> 版本：v2.2.1（源码级剖析） | 日期：2026-09-15
+>
+> 本文面向开发者，落到真实模块 / 类 / 路径。官网 `website/public/docs/architecture.zh.md` 讲的是相对稳定的 Agent OS 概念；本文以仓库源码为准。
 
 ---
 
@@ -11,17 +13,21 @@
 3. [整体架构](#3-整体架构)
 4. [目录结构](#4-目录结构)
 5. [核心模块详解](#5-核心模块详解)
-   - 5.1 [Agent 核心层](#51-agent-核心层)
-   - 5.2 [应用层（App Layer）](#52-应用层app-layer)
+   - 5.1 [Agent OS：工作区与注册表](#51-agent-os工作区与注册表)
+   - 5.2 [Runtime 与 QwenPawAgent](#52-runtime-与-qwenpawagent)
    - 5.3 [频道系统（Channels）](#53-频道系统channels)
    - 5.4 [Skills 系统](#54-skills-系统)
    - 5.5 [定时任务系统（Crons）](#55-定时任务系统crons)
-   - 5.6 [MCP 集成](#56-mcp-集成)
+   - 5.6 [Drivers（MCP 等外部能力）](#56-driversmcp-等外部能力)
    - 5.7 [配置管理](#57-配置管理)
    - 5.8 [LLM 提供商系统（Providers）](#58-llm-提供商系统providers)
    - 5.9 [本地模型支持](#59-本地模型支持)
-   - 5.10 [记忆管理](#510-记忆管理)
-   - 5.11 [Runner 与会话管理](#511-runner-与会话管理)
+   - 5.10 [记忆、Scroll 与上下文](#510-记忆scroll-与上下文)
+   - 5.11 [Loop Engineering 与 Agent Mode](#511-loop-engineering-与-agent-mode)
+   - 5.12 [治理、沙箱与安全](#512-治理沙箱与安全)
+   - 5.13 [插件与 PawApp](#513-插件与-pawapp)
+   - 5.14 [Hub、Harness 与 ACP](#514-hubharness-与-acp)
+   - 5.15 [Browser-use 与 Computer-use](#515-browser-use-与-computer-use)
 6. [API 接口设计](#6-api-接口设计)
 7. [数据流](#7-数据流)
 8. [数据存储方案](#8-数据存储方案)
@@ -29,1657 +35,965 @@
 10. [CLI 系统](#10-cli-系统)
 11. [部署方案](#11-部署方案)
 12. [扩展机制](#12-扩展机制)
+13. [1.x → 2.x 映射](#13-1x--2x-映射)
 
 ---
 
 ## 1. 项目概述
 
-CoPaw 是一个**个人 AI 助手平台**，支持多频道接入、Skills 插件化扩展、本地模型运行和 MCP 协议集成。它以「本地优先、数据可控」为设计理念，允许用户通过钉钉、飞书、QQ、Discord、iMessage 等多种渠道与 AI 助手交互，同时提供 Web 控制台进行可视化管理。
+QwenPaw 是一个**本地优先的个人 AI 助手 / Agent OS**。一次安装可托管多个互相隔离的智能体；每个智能体对应一个 **Workspace**（磁盘目录 + 一组运行时服务）。请求经 **Runtime** 编排，在治理与沙箱之下把模型、工具、记忆、Skills 和 Drivers 串起来。内核是进程内的 **AgentScope 2.0**（智能体循环、会话、事件流、工具层），QwenPaw 是其上的操作系统层。
+
+入口包括 IM 频道、Web Console、终端 TUI 和 CLI。数据默认落在用户本机文件系统（`WORKING_DIR`，通常为 `~/.qwenpaw`；若存在遗留 `~/.copaw` 则继续使用该目录）。
 
 **核心特性：**
 
 | 特性 | 说明 |
 |------|------|
-| 多频道接入 | 支持 DingTalk、Feishu、QQ、Discord、iMessage、Console |
-| Skills 扩展 | 插件化 Skills 系统，SKILL.md 格式定义，支持从 Hub 搜索安装 |
-| 本地模型 | 支持 llama.cpp、Apple Silicon MLX 及 Ollama 后端 |
-| 定时任务 | APScheduler 驱动的 Cron 任务 + 心跳机制 |
-| MCP 协议 | 集成 Model Context Protocol 客户端，自动发现 MCP 工具 |
-| 配置热重载 | 配置变更与 MCP 配置变更均无需重启服务 |
-| Web 控制台 | React 18 + Ant Design 管理界面，可视化配置所有功能 |
-| 双层记忆 | 短期对话上下文 + ReMe-AI 驱动的长期记忆，自动压缩 |
+| 多 Agent 工作区 | `WorkspaceRegistry` 懒加载多个 `Workspace`；文件、记忆、频道、定时任务按智能体隔离 |
+| 多频道入口 | 钉钉、飞书、QQ、Discord、Telegram、Slack、微信、企业微信、iMessage、Console 等（见 §5.3） |
+| Skills | `SKILL.md` 指令注入；全局 `skill_pool/` + 每工作区 `skills/` |
+| Drivers | 协议中立的外部能力层；当前落地的协议是 **MCP**（凭据加密 + 调用时策略门控） |
+| Loop Engineering | Coding / Mission / Goal / 自定义循环模板 + 可组合 StopGate |
+| Scroll 上下文 | 每轮持久化；滚出窗口的轮次建索引，按需 `recall_history`，不以摘要替换原文 |
+| ReMe Light | `ReMeLightMemoryManager`（ReMe 0.4）把对话沉淀为可编辑 Markdown 知识库 |
+| 插件 / PawApp | `PluginLoader` 扩展工具、频道、记忆后端、前端、HTTP；PawApp 是带 `meta.pawapp` 的插件 |
+| TUI | 无子命令时 `qwenpaw` 打开 Textual 全屏对话，与 Console / 频道共享同一智能体 |
+| Hub | `qwenpaw hub` 多用户运行时控制面（本地 / Docker 供给） |
+| 安全 | Tool Guard、File Guard、Skill Scanner、OS 沙箱（macOS seatbelt / Linux bwrap·landlock / Windows AppContainer） |
 
 ---
 
 ## 2. 技术栈
 
+版本以 `pyproject.toml` 与 `console/package.json` 为准。
+
 ### 后端
 
 | 技术 | 版本/说明 |
 |------|-----------|
-| Python | 3.10 ~ <3.14 |
-| FastAPI | Web 框架，通过 agentscope-runtime 提供 REST API |
-| AgentScope | 1.0.16.dev0，Agent 基础框架（ReActAgent） |
-| AgentScope Runtime | 1.1.0，Agent 运行时（Runner、Session 管理） |
-| Uvicorn | >=0.40.0，ASGI 服务器 |
-| APScheduler | >=3.11.2 <4，定时任务调度 |
-| Pydantic | 数据验证与序列化（Config、API 模型） |
-| ReMe-AI | 0.3.0.0，长期记忆管理（语义检索） |
-| Playwright | >=1.49.0，浏览器自动化 |
-| Transformers | >=4.30.0，Tokenizer / Embedding 支持 |
-| python-dotenv | >=1.0.0，环境变量管理 |
+| Python | `>=3.11,<3.14` |
+| FastAPI | Web / REST；应用入口 `src/qwenpaw/app/_app.py` |
+| AgentScope | `agentscope[model-ollama]==2.0.7.post1`，进程内 ReAct / Agent / Toolkit |
+| Uvicorn | `>=0.40.0`，ASGI |
+| APScheduler | `>=3.11.2,<4`，Cron |
+| Pydantic | v2，`Config` / Agent 配置 / API 模型 |
+| ReMe-AI | `reme-ai==0.4.1.11`（另有 `reme-auto-fin`、`reme-daily-paper`） |
+| MCP SDK | `mcp>=1.28,<2.0` |
+| Playwright | `>=1.49.0`，浏览器自动化 |
+| Textual | `>=8.2.8,<8.2.9`，捆绑 TUI |
+| Transformers | `>=4.30.0`，Tokenizer / Embedding |
+| python-dotenv | `>=1.0.0` |
+| OpenAI SDK | `>=2.0.0,<=2.33.0` |
+| agent-client-protocol | `>=0.9.0,<0.11.0`，ACP |
+| python-lsp-server | Coding Mode 的 Python LSP 回退 |
+| ast-grep-cli | Coding Mode `ast_search` |
+
+**已移除：** agentscope-runtime（1.x 的 `AgentApp` / `Runner` 基类）。会话与流式查询由 `Workspace.stream_query()` → `Runtime.run()` 完成。
 
 ### 前端（Console）
 
 | 技术 | 版本/说明 |
 |------|-----------|
-| React | 18，前端框架 |
-| TypeScript | ~5.8.3，类型安全 |
-| Vite | >=6.3.5，构建工具 |
-| Ant Design | ^5.29.1，UI 组件库 |
-| antd-style | ^3.7.1，CSS-in-JS |
-| React Router | ^7.13.0，前端路由 |
-| i18next | ^25.8.4，国际化 |
-| ahooks | ^3.9.6，React Hooks 工具集 |
-| @agentscope-ai/chat | ^1.1.50，聊天组件 |
-| @agentscope-ai/design | ^1.0.14，设计主题 |
-| @agentscope-ai/icons | ^1.0.46，图标库 |
-| lucide-react | ^0.562.0，图标补充 |
+| React | ^18 |
+| TypeScript | ~5.8.3 |
+| Vite | 6.4.1 |
+| Ant Design | 5.29.3 |
+| antd-style | ^3.7.1 |
+| React Router | ^7.13.0 |
+| i18next | ^25.8.4 |
+| ahooks | ^3.9.6 |
+| zustand | ^5.0.3 |
+| @agentscope-ai/chat | `1.1.73-beta.*` |
+| @agentscope-ai/design | 1.0.29 |
+| @agentscope-ai/icons | 1.0.67 |
+| lucide-react | ^0.562.0 |
+| monaco-editor | 0.55.1 |
+| @tauri-apps/api | ^2.10.1（桌面端） |
 
 ### 频道集成 SDK
 
-| 频道 | SDK |
-|------|-----|
-| 钉钉 | dingtalk-stream >=0.24.3 |
-| 飞书 | lark-oapi >=1.5.3 |
-| Discord | discord-py >=2.3 |
-| QQ | 内置 WebSocket 实现 |
+| 频道 | 依赖 |
+|------|------|
+| 钉钉 | `dingtalk-stream>=0.24.3`，`alibabacloud-dingtalk` 等 |
+| 飞书 | `lark-oapi>=1.5.3` |
+| Discord | `discord-py>=2.3` |
+| Telegram | `python-telegram-bot>=20.0` |
+| Slack | `slack-bolt>=1.22.0` |
+| 企业微信 | `wecom-aibot-python-sdk==1.0.2` |
+| Matrix | `matrix-nio>=0.25.0` |
+| MQTT | `paho-mqtt>=2.0.0` |
+| Voice / Twilio | `twilio>=9.10.2` |
+| SIP | 可选 extra `qwenpaw[sip]`（`pyVoIP` 等） |
+| QQ / OneBot / 微信 / 元宝 / 小艺 | 仓库内实现（WebSocket / HTTP / 协议编解码） |
 | iMessage | macOS 原生（SQLite 读取 + AppleScript 发送） |
 
-### 可选本地模型后端
+### 可选 extra
 
-| 后端 | 说明 | 依赖 |
-|------|------|------|
-| llama.cpp | 跨平台（CPU/GPU） | llama-cpp-python >=0.3.0 |
-| MLX | Apple Silicon（M 系列芯片） | mlx-lm >=0.10.0 |
-| Ollama | 通过 Ollama API 调用本地模型 | 系统安装 Ollama |
+| extra | 用途 |
+|-------|------|
+| `local` | `huggingface_hub`，本地模型目录 |
+| `hub` | `docker>=7.1,<8`，Hub Docker 供给 |
+| `whisper` | 语音转写 |
+| `codex` / `qoder` | 第三方 Harness |
+| `qwenpaw-data` | QwenPaw Data 组件 |
+| `sip` / `sip-livekit` | SIP / LiveKit 语音 |
+| `full` | 上述组合 |
+
+本地推理后端：`src/qwenpaw/local_models/llamacpp.py` 的 `LlamaCppBackend`；Ollama / LM Studio 走 Provider 目录（`PROVIDER_OLLAMA`、`PROVIDER_LMSTUDIO`）。
 
 ---
 
 ## 3. 整体架构
 
+2.x 分层：**入口 → Runtime 调度 → Workspace（资源 / 治理 / 沙箱）→ Drivers → AgentScope 2.0**。
+
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│                          用户侧（多频道入口）                          │
-│  钉钉  │  飞书  │  QQ  │  Discord  │  iMessage  │  Web Console      │
-└────────────────────────────┬────────────────────────────────────────┘
-                             │
-┌────────────────────────────▼────────────────────────────────────────┐
-│                       FastAPI 应用层                                  │
-│  ┌──────────────┐  ┌──────────────┐  ┌────────────┐  ┌──────────┐  │
-│  │ChannelManager│  │  REST API    │  │CronManager │  │ MCP Mgr  │  │
-│  │(频道管理器)   │  │(路由层)      │  │(定时任务)   │  │(MCP客户端)│  │
-│  └──────┬───────┘  └──────────────┘  └─────┬──────┘  └──────────┘  │
-│         │                                   │                        │
-│  ┌──────▼───────────────────────────────────▼──────────────────┐    │
-│  │                AgentRunner (运行器)                           │    │
-│  │  SafeJSONSession │ ChatManager │ ConsolePushStore            │    │
-│  └──────────────────────────┬───────────────────────────────────┘    │
-│                              │                                       │
-│  ┌───────────────────────────▼──────────────────────────────────┐    │
-│  │                     ConfigWatcher                             │    │
-│  │           config.json 热重载  │  MCPConfigWatcher             │    │
-│  └───────────────────────────────────────────────────────────────┘    │
-└────────────────────────────│────────────────────────────────────────┘
-                              │
-┌─────────────────────────────▼───────────────────────────────────────┐
-│                       CoPawAgent (ReAct Agent)                       │
-│                                                                      │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌──────────────┐  │
-│  │ LLM 推理   │  │ 工具调用   │  │Skills 执行 │  │  记忆管理    │  │
-│  │(Providers) │  │ (Toolkit)  │  │(SkillsSvc) │  │(MemoryMgr)   │  │
-│  └────────────┘  └────────────┘  └────────────┘  └──────────────┘  │
-│                                                                      │
-│  ┌────────────┐  ┌────────────┐                                     │
-│  │CommandHdlr │  │  Hooks     │                                     │
-│  │(/compact..)│  │(bootstrap, │                                     │
-│  └────────────┘  │ mem_compact)│                                     │
-│                  └────────────┘                                      │
-└─────────────────────────────────────────────────────────────────────┘
-          │                │               │
-   ┌──────▼──┐      ┌──────▼──┐    ┌──────▼───────┐
-   │LLM 提供商│      │内置/自定义│    │Skills Hub    │
-   │DashScope │      │Skills   │    │(在线技能仓库)│
-   │OpenAI等  │      │(SKILL.md)│   │ClawHub/GitHub│
-   │Ollama    │      └─────────┘    └──────────────┘
-   │本地模型  │
-   └──────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│ 入口                                                                      │
+│  频道(IM)  │  Web Console  │  TUI(Textual)  │  CLI / desktop / hub       │
+└───────────────────────────────┬──────────────────────────────────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────────────┐
+│ FastAPI 进程（src/qwenpaw/app/_app.py lifespan）                           │
+│                                                                          │
+│  AppServiceManager          WorkspaceRegistry (IS-A MultiAgentManager)   │
+│  ├─ ToolCoordinator         ├─ 懒加载 / 并行启动 / 热重载                  │
+│  ├─ ApprovalCoordinator     └─ 每个 agent_id → Workspace                 │
+│  └─ task_tracker                                                         │
+│                                                                          │
+│  PluginLoader  │  ProviderManager  │  LocalModelManager  │  BackupMgr    │
+│  Browser kernel idle watchdog                                            │
+└───────────────────────────────┬──────────────────────────────────────────┘
+                                │ 路由到目标工作区
+┌───────────────────────────────▼──────────────────────────────────────────┐
+│ Workspace（每智能体一份隔离空间）                                          │
+│                                                                          │
+│  资源                          治理                         沙箱          │
+│  ├─ 记忆 (ReMe Light / none)   ResourceGovernor             create_sandbox│
+│  ├─ Scroll history.db          allow / deny / ask / sandbox  per-tool-call│
+│  ├─ Skills / md_files          Tool Guard / Skill Scanner                │
+│  ├─ ChannelManager             加密凭据 credentials.yaml                  │
+│  ├─ CronManager                                                              │
+│  ├─ ChatManager + SafeJSONSession                                            │
+│  └─ WorkspacePlugins (tools/hooks/commands/modes)                            │
+│                                                                          │
+│  stream_query() → Runtime.run()  或  HarnessRuntime (codex/qoder)        │
+└──────────────┬─────────────────────────────────────────┬─────────────────┘
+               │                                         │
+┌──────────────▼──────────────┐            ┌─────────────▼─────────────────┐
+│ Drivers（DriverManager）     │            │ Runtime 8 阶段 + AgentBuilder  │
+│  MCPDriverHandler（落地）    │            │ QwenPawAgent (AgentScope Agent)│
+│  DriverCard YAML + 策略门控  │            │ Loop gates / Scroll / Toolkit  │
+│  ACP/A2A：见 §5.6 / §5.14    │            └────────────────────────────────┘
+└─────────────────────────────┘
+                                │
+┌───────────────────────────────▼──────────────────────────────────────────┐
+│ 基建 · AgentScope 2.0（库，进程内）                                        │
+│  Agent 循环 · Toolkit · 消息/状态序列化 · 流式事件                          │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
+
+依赖方向（不可逆）：`cli → app → agents → config / providers / constant`。`agents/__init__.py` 用 `__getattr__` 懒加载 `QwenPawAgent`，避免 CLI 拉起 AgentScope / Playwright。
 
 ---
 
 ## 4. 目录结构
 
 ```
-CoPaw/
-├── src/copaw/                    # Python 核心源码
-│   ├── __init__.py               # 包初始化（懒加载 CoPawAgent）
-│   ├── __version__.py            # 版本号定义
-│   ├── __main__.py               # python -m copaw 入口
-│   ├── constant.py               # 全局常量与路径定义
-│   ├── agents/                   # Agent 核心实现
-│   │   ├── __init__.py           # 懒加载入口（避免重量级导入）
-│   │   ├── react_agent.py        # CoPawAgent 主类（继承 ReActAgent）
-│   │   ├── command_handler.py    # 系统命令处理器 (/compact, /new 等)
-│   │   ├── prompt.py             # PromptBuilder + PromptConfig
-│   │   ├── model_factory.py      # 模型与 Formatter 创建（文件块支持）
-│   │   ├── skills_manager.py     # SkillService（Skills CRUD + 同步）
-│   │   ├── skills_hub.py         # Skills Hub 在线安装
-│   │   ├── hooks/                # Agent 生命周期钩子
-│   │   │   ├── bootstrap.py      # BootstrapHook（首次启动引导）
-│   │   │   └── memory_compaction.py # MemoryCompactionHook（自动压缩）
-│   │   ├── memory/               # 记忆管理模块
-│   │   │   ├── copaw_memory.py   # CoPawInMemoryMemory（会话记忆 + 压缩摘要）
-│   │   │   ├── memory_manager.py # MemoryManager（ReMe-AI 长期记忆）
-│   │   │   └── agent_md_manager.py # AgentMdManager（MD 文件读写）
-│   │   ├── tools/                # 内置工具集
-│   │   │   ├── shell.py          # execute_shell_command
-│   │   │   ├── file_io.py        # read_file / write_file / edit_file
-│   │   │   ├── file_search.py    # grep_search / glob_search
-│   │   │   ├── browser_control.py# browser_use（Playwright）
-│   │   │   ├── desktop_screenshot.py # desktop_screenshot（mss）
-│   │   │   ├── send_file.py      # send_file_to_user
-│   │   │   ├── get_current_time.py # get_current_time
-│   │   │   └── memory_search.py  # memory_search（条件注册）
-│   │   ├── skills/               # 内置 Skills（SKILL.md 定义）
-│   │   │   ├── browser_visible/SKILL.md
-│   │   │   ├── cron/SKILL.md
-│   │   │   ├── dingtalk_channel/SKILL.md
-│   │   │   ├── docx/SKILL.md
-│   │   │   ├── file_reader/SKILL.md
-│   │   │   ├── himalaya/SKILL.md
-│   │   │   ├── news/SKILL.md
-│   │   │   ├── pdf/SKILL.md
-│   │   │   ├── pptx/SKILL.md
-│   │   │   └── xlsx/SKILL.md
-│   │   ├── md_files/             # Agent 默认人设文件
-│   │   │   ├── en/               # 英文模板
-│   │   │   └── zh/               # 中文模板
-│   │   └── utils/                # Agent 工具函数
-│   │       ├── message_utils.py  # 文件/媒体块处理
-│   │       ├── token_counter.py  # Token 计数
-│   │       └── tool_sanitizer.py # 工具消息修正
-│   ├── app/                      # FastAPI 应用层
-│   │   ├── _app.py               # FastAPI 应用入口 + lifespan 生命周期
-│   │   ├── download_task_store.py# 模型下载任务内存存储
-│   │   ├── console_push_store.py # Console 推送消息内存存储
-│   │   ├── channels/             # 频道连接器
-│   │   │   ├── base.py           # BaseChannel 抽象基类
-│   │   │   ├── schema.py         # ChannelAddress / ChannelType 类型
-│   │   │   ├── registry.py       # 频道注册表（内置 + 自定义发现）
-│   │   │   ├── manager.py        # ChannelManager（队列 + Worker 消费模型）
-│   │   │   ├── renderer.py       # MessageRenderer + RenderStyle
-│   │   │   ├── utils.py          # file_url_to_local_path 等工具
-│   │   │   ├── console/          # Console 频道（Web UI 交互）
-│   │   │   ├── dingtalk/         # 钉钉频道
-│   │   │   │   ├── channel.py    # DingTalkChannel
-│   │   │   │   ├── handler.py    # Stream 回调处理
-│   │   │   │   ├── markdown.py   # DingTalk Markdown 转换
-│   │   │   │   ├── content_utils.py
-│   │   │   │   ├── constants.py
-│   │   │   │   └── utils.py
-│   │   │   ├── feishu/           # 飞书频道
-│   │   │   │   ├── channel.py    # FeishuChannel（WebSocket）
-│   │   │   │   ├── constants.py
-│   │   │   │   └── utils.py
-│   │   │   ├── discord_/         # Discord 频道
-│   │   │   │   └── channel.py    # DiscordChannel
-│   │   │   ├── imessage/         # iMessage 频道（macOS）
-│   │   │   │   └── channel.py    # IMessageChannel（SQLite 轮询）
-│   │   │   └── qq/               # QQ 频道
-│   │   │       └── channel.py    # QQChannel（WebSocket + HTTP）
-│   │   ├── crons/                # 定时任务
-│   │   │   ├── manager.py        # CronManager（APScheduler 封装）
-│   │   │   ├── executor.py       # CronExecutor（任务执行器）
-│   │   │   ├── heartbeat.py      # 心跳任务（HEARTBEAT.md 驱动）
-│   │   │   ├── models.py         # 数据模型（CronJobSpec 等）
-│   │   │   ├── api.py            # API 路由
-│   │   │   └── repo/
-│   │   │       ├── base.py       # BaseJobRepository 抽象
-│   │   │       └── json_repo.py  # JsonJobRepository（jobs.json）
-│   │   ├── mcp/                  # MCP 客户端管理
-│   │   │   ├── manager.py        # MCPClientManager（多客户端管理）
-│   │   │   └── watcher.py        # MCPConfigWatcher（配置热重载）
-│   │   ├── routers/              # API 路由定义
-│   │   │   ├── __init__.py       # api_router 汇总
-│   │   │   ├── agent.py          # /api/agent（工作文件 + 记忆文件）
-│   │   │   ├── config.py         # /api/config（频道配置）
-│   │   │   ├── providers.py      # /api/models（LLM 提供商）
-│   │   │   ├── skills.py         # /api/skills（Skills CRUD）
-│   │   │   ├── local_models.py   # /api/local-models（本地模型下载）
-│   │   │   ├── ollama_models.py  # /api/ollama-models（Ollama 模型）
-│   │   │   ├── mcp.py            # /api/mcp（MCP 服务管理）
-│   │   │   ├── workspace.py      # /api/workspace（上传/下载工作空间）
-│   │   │   ├── envs.py           # /api/envs（环境变量管理）
-│   │   │   └── console.py        # /api/console（推送消息轮询）
-│   │   └── runner/               # Agent 运行器
-│   │       ├── runner.py         # AgentRunner（继承 agentscope-runtime Runner）
-│   │       ├── session.py        # SafeJSONSession（跨平台文件名安全）
-│   │       ├── manager.py        # ChatManager（聊天列表管理）
-│   │       ├── models.py         # ChatSpec / ChatHistory 模型
-│   │       ├── api.py            # /api/chats 路由
-│   │       ├── utils.py          # make_process_from_runner 等
-│   │       ├── query_error_dump.py # 错误转储（调试用）
-│   │       └── repo/
-│   │           ├── base.py       # BaseChatRepository 抽象
-│   │           └── json_repo.py  # JsonChatRepository（chats.json）
-│   ├── cli/                      # 命令行接口
-│   │   ├── main.py               # CLI 入口（click 命令组）
-│   │   ├── app_cmd.py            # copaw app（启动服务）
-│   │   ├── init_cmd.py           # copaw init（初始化配置）
-│   │   ├── channels_cmd.py       # copaw channels（频道管理）
-│   │   ├── cron_cmd.py           # copaw cron（定时任务管理）
-│   │   ├── skills_cmd.py         # copaw skills（Skills 管理）
-│   │   ├── providers_cmd.py      # copaw models（模型提供商管理）
-│   │   ├── clean_cmd.py          # copaw clean（清理工作目录）
-│   │   ├── utils.py              # questionary 交互封装
-│   │   └── http.py               # httpx CLI 客户端
-│   ├── config/                   # 配置管理
-│   │   ├── config.py             # Config Pydantic 模型
-│   │   ├── utils.py              # 配置加载/保存工具
-│   │   └── watcher.py            # ConfigWatcher 热重载（FSEvents/inotify）
-│   ├── envs/                     # 环境变量管理
-│   │   └── *.py                  # EnvManager（envs.json 读写）
-│   ├── providers/                # LLM 提供商管理
-│   │   ├── registry.py           # ProviderRegistry（内置 + 自定义提供商）
-│   │   ├── store.py              # ProviderStore（providers.json 持久化）
-│   │   ├── models.py             # ProviderConfig / ModelConfig 模型
-│   │   └── ollama_manager.py     # OllamaModelManager（Ollama API 封装）
-│   ├── local_models/             # 本地模型支持
-│   │   ├── manager.py            # LocalModelManager
-│   │   ├── registry.py           # 后端注册表
-│   │   └── backends/
-│   │       ├── llamacpp.py       # llama.cpp 后端
-│   │       └── mlx.py            # MLX 后端
-│   ├── tokenizer/                # Tokenizer 工具
-│   └── utils/                    # 通用工具函数
-│       └── logging.py            # ColorFormatter / SuppressPathAccessLogFilter
-├── console/                      # React 前端控制台
-│   ├── src/
-│   │   ├── App.tsx               # 应用入口（BrowserRouter + ConfigProvider）
-│   │   ├── main.tsx              # ReactDOM 渲染入口
-│   │   ├── i18n.ts               # i18next 初始化
-│   │   ├── api/                  # API 客户端封装
-│   │   │   ├── config.ts         # 基础配置
-│   │   │   ├── request.ts        # axios 请求封装
-│   │   │   ├── types/            # TypeScript 类型定义
-│   │   │   └── modules/          # 按模块分离的 API 调用
-│   │   │       ├── agent.ts      # Agent API
-│   │   │       ├── channel.ts    # 频道 API
-│   │   │       ├── chat.ts       # 聊天 API
-│   │   │       ├── console.ts    # Console 推送 API
-│   │   │       ├── cronjob.ts    # 定时任务 API
-│   │   │       ├── env.ts        # 环境变量 API
-│   │   │       ├── localModel.ts # 本地模型 API
-│   │   │       ├── mcp.ts        # MCP API
-│   │   │       ├── ollamaModel.ts# Ollama 模型 API
-│   │   │       ├── provider.ts   # 提供商 API
-│   │   │       ├── skill.ts      # Skills API
-│   │   │       └── workspace.ts  # 工作空间 API
-│   │   ├── components/           # 公共 React 组件
-│   │   │   ├── ConsoleCronBubble/# Cron 推送气泡
-│   │   │   ├── LanguageSwitcher.tsx
-│   │   │   └── MarkdownCopy/     # Markdown 渲染 + 复制
-│   │   ├── layouts/              # 布局组件
-│   │   │   ├── MainLayout/       # 主布局 + 路由表
-│   │   │   ├── Sidebar.tsx       # 侧边栏导航
-│   │   │   └── Header.tsx        # 顶部栏
-│   │   ├── pages/                # 页面组件
-│   │   │   ├── Chat/             # 聊天主界面
-│   │   │   ├── Agent/            # Agent 配置组
-│   │   │   │   ├── Config/       # Agent 运行配置
-│   │   │   │   ├── Skills/       # Skills 管理
-│   │   │   │   ├── Workspace/    # 工作文件 + 记忆文件编辑
-│   │   │   │   └── MCP/          # MCP 服务管理
-│   │   │   ├── Control/          # 运维控制组
-│   │   │   │   ├── Channels/     # 频道配置
-│   │   │   │   ├── Sessions/     # 会话管理
-│   │   │   │   └── CronJobs/     # 定时任务管理
-│   │   │   └── Settings/         # 设置组
-│   │   │       ├── Models/       # 模型提供商 + 本地模型 + Ollama
-│   │   │       └── Environments/ # 环境变量管理
-│   │   ├── locales/              # i18n 国际化资源
-│   │   │   ├── en.json           # 英文
-│   │   │   └── zh.json           # 中文
-│   │   ├── styles/               # 全局样式
-│   │   └── utils/                # 工具函数
-│   └── public/                   # 静态资源
-├── website/                      # 文档网站
-│   └── public/docs/              # 文档 Markdown 内容
-├── deploy/                       # 部署相关配置
-│   ├── Dockerfile                # 多阶段构建
-│   ├── entrypoint.sh             # supervisord 启动脚本
-│   └── config/
-│       └── supervisord.conf.template # supervisord 模板
-├── scripts/                      # 工具脚本
-├── docs/                         # 本架构文档目录
-├── pyproject.toml                # Python 项目配置
-├── .flake8                       # flake8 配置
-├── .pre-commit-config.yaml       # Pre-commit hooks
-├── README.md                     # 英文说明
-└── README_zh.md                  # 中文说明
+CoPaw/   # 仓库根；PyPI 包名 qwenpaw
+├── src/qwenpaw/                 # Python 核心
+│   ├── __init__.py
+│   ├── __version__.py           # 包版本（当前源码为 2.2.2b1）
+│   ├── __main__.py              # python -m qwenpaw
+│   ├── constant.py              # WORKING_DIR、心跳、路径常量
+│   ├── agents/                  # 智能体实现
+│   │   ├── react_agent.py       # QwenPawAgent（Agent + CodingModeMixin）
+│   │   ├── model_factory.py
+│   │   ├── prompt.py            # 工作区 Markdown 提示词辅助
+│   │   ├── skill_system/        # SkillPoolService / SkillService
+│   │   ├── skills/              # 内置 SKILL.md（按语言后缀 -zh/-en）
+│   │   ├── tools/               # @tool_descriptor 内置工具
+│   │   ├── memory/              # ReMeLightMemoryManager 等
+│   │   ├── context/scroll/      # ScrollContextManager
+│   │   ├── acp/                 # ACP 客户端/服务端（懒加载）
+│   │   ├── md_files/            # AGENTS.md / SOUL.md 等模板
+│   │   └── utils/
+│   ├── app/                     # FastAPI 应用
+│   │   ├── _app.py              # lifespan + 静态 Console
+│   │   ├── workspace_registry.py
+│   │   ├── multi_agent_manager.py
+│   │   ├── workspace/           # Workspace、ServiceManager、bootstrap
+│   │   ├── app_services/        # 跨工作区协调器
+│   │   ├── channels/            # BaseChannel + 各频道实现
+│   │   ├── crons/               # CronManager / CronExecutor / heartbeat
+│   │   ├── chats/               # ChatManager、SafeJSONSession
+│   │   ├── routers/             # REST
+│   │   ├── mcp/                 # MCP API schema / config_service（运行时走 Drivers）
+│   │   ├── computer_use/        # 桌面 Computer-use 宿主能力
+│   │   ├── approvals/
+│   │   └── migration.py         # 1.x 工作区 / Skills 迁移
+│   ├── runtime/                 # Runtime、AgentBuilder、8 阶段钩子
+│   ├── drivers/                 # DriverManager、MCP handler、凭据
+│   ├── loop/                    # StopGate 目录与编译器
+│   ├── modes/                   # coding / mission / goal / custom_loop / default
+│   ├── governance/              # ResourceGovernor、PolicyGuardedTool
+│   ├── sandbox/                 # 各 OS 沙箱实现
+│   ├── security/                # tool_guard、skill_scanner、secret_store
+│   ├── plugins/                 # PluginLoader / PluginRegistry
+│   ├── pawapp/                  # PawApp SDK（薄封装插件系统）
+│   ├── hub/                     # 多用户 Hub 控制面
+│   ├── harnesses/               # Codex / Qoder 外部智能体适配
+│   ├── hooks/                   # Runtime 生命周期钩子实现
+│   ├── providers/               # ProviderManager + 内置目录
+│   ├── local_models/            # LlamaCppBackend、下载管理
+│   ├── config/                  # Config / AgentProfileConfig / watcher
+│   ├── browser/                 # 统一 Browser-use 运行时（experimental）
+│   ├── cli/                     # click LazyGroup + TUI
+│   ├── envs/                    # 环境变量持久化
+│   ├── backup/                  # 备份 / 恢复
+│   ├── market/                  # 插件市场
+│   ├── portability/             # PawPort 导入
+│   ├── checkpoints/
+│   ├── token_usage/
+│   ├── tokenizer/
+│   └── utils/
+├── console/                     # React 控制台（构建产物不提交 git）
+├── website/public/docs/         # 用户文档站点
+├── deploy/                      # Dockerfile、supervisord、entrypoint
+├── packages/qwenpawmail-mcp/    # 邮件 MCP 附属包
+├── pyproject.toml
+└── docs/architecture.md         # 本文
 ```
 
 ---
 
 ## 5. 核心模块详解
 
-### 5.1 Agent 核心层
+### 5.1 Agent OS：工作区与注册表
 
-**`CoPawAgent`**（继承 AgentScope 的 `ReActAgent`）是整个系统的智能核心。
+**工作区是隔离的基本单位。** 一次安装多个智能体，每个对应 `config.agents.profiles[agent_id].workspace_dir`（默认 `{WORKING_DIR}/workspaces/<id>`）。首次被请求时才创建并 `start()`。
 
-#### 类定义
+#### WorkspaceRegistry
 
-```python
-class CoPawAgent(ReActAgent):
-    def __init__(
-        self,
-        env_context: Optional[str] = None,
-        enable_memory_manager: bool = True,
-        mcp_clients: Optional[List[Any]] = None,
-        memory_manager: MemoryManager | None = None,
-        max_iters: int = 50,              # ReAct 最大迭代轮次
-        max_input_length: int = 128 * 1024,  # 128K tokens 上下文上限
-    )
-```
-
-#### 初始化流程
-
-```
-CoPawAgent.__init__()
-├── 1. _create_toolkit()            → 注册内置工具到 Toolkit
-├── 2. _register_skills(toolkit)    → 加载 active_skills/ 中的 Skills
-├── 3. _build_sys_prompt()          → 从 md_files/ 构建系统提示词
-├── 4. 创建 Model + Formatter       → model_factory.create_model_and_formatter()
-│       └── 增强 Formatter: 文件块支持 + 工具消息修正
-├── 5. _setup_memory_manager()      → 初始化长期记忆 + 注册 memory_search
-├── 6. CommandHandler 初始化         → 绑定 /compact /new /clear 等命令
-└── 7. _register_hooks()            → 注册 pre_reasoning 钩子
-        ├── BootstrapHook            → 首次启动引导
-        └── MemoryCompactionHook     → 自动上下文压缩
-```
-
-#### 懒加载机制
-
-`agents/__init__.py` 使用 `__getattr__` 实现懒加载，CLI 导入时不会拉起 AgentScope、Playwright 等重量级依赖：
+`src/qwenpaw/app/workspace_registry.py`：
 
 ```python
-def __getattr__(name):
-    if name == "CoPawAgent":
-        from .react_agent import CoPawAgent
-        return CoPawAgent
-    # ...
+class WorkspaceRegistry(MultiAgentManager):
+    def _create_workspace(self, agent_id, workspace_dir) -> Workspace:
+        workspace = Workspace(...)
+        workspace.bootstrap_plugins(**self._bootstrap_kwargs)
+        workspace.set_app_services(self.app_services)
+        return workspace
 ```
 
-#### ReAct 推理循环
+`lifespan` 把同一实例同时挂到 `app.state.workspace_registry` 与 `app.state.multi_agent_manager`（注释写明 IS-A，兼容旧路由）。
 
-```
-用户消息 → CoPawAgent.reply(msg)
-              │
-              ├── 1. 预处理：process_file_and_media_blocks_in_message(msg)
-              │        └── 下载文件/媒体附件到本地
-              │
-              ├── 2. 命令检查：CommandHandler.is_command(query)
-              │        └── 是命令 → handle_command() → 直接返回
-              │
-              └── 3. 委托父类：super().reply(msg)
-                       │
-                       ├── pre_reasoning hooks:
-                       │   ├── BootstrapHook.__call__()
-                       │   │     └── 首次对话时注入 BOOTSTRAP.md 引导
-                       │   └── MemoryCompactionHook.__call__()
-                       │         └── 检查 Token 用量 > 阈值时自动压缩
-                       │
-                       └── ReAct Loop (max_iters=50):
-                            ├── Think: LLM 生成文本 + 工具调用
-                            ├── Act:   Toolkit 执行工具函数
-                            ├── Observe: 工具返回结果
-                            └── Repeat / Final Answer
-```
+#### MultiAgentManager
 
-#### 系统命令
+`src/qwenpaw/app/multi_agent_manager.py`：懒加载、`get_agent()` 去重、自定义智能体并行启动（信号量 `CUSTOM_AGENT_STARTUP_CONCURRENCY`，默认 5）、`reload_agent()` 零停机替换（配置世代计数防止过期快照写回）。
 
-| 命令 | 处理方法 | 功能 |
-|------|----------|------|
-| `/compact` | `_process_compact` | 压缩对话上下文（触发 MemoryManager） |
-| `/new` | `_process_new` | 新建空会话 |
-| `/clear` | `_process_clear` | 清空当前会话 |
-| `/history` | `_process_history` | 查看会话历史 |
-| `/compact_str` | `_process_compact_str` | 查看压缩摘要 |
-| `/await_summary` | `_process_await_summary` | 等待异步摘要完成 |
+启动时 `start_all_configured_agents()`：先起核心智能体（含 `default`），再并行其余；内置 QA 档案 id 为 `QwenPaw_QA_Agent_0.2`。
 
-#### 内置工具集（Tools）
+#### Workspace
 
-| 工具函数 | 文件 | 功能 |
-|----------|------|------|
-| `execute_shell_command` | `shell.py` | 执行终端命令 |
-| `read_file` | `file_io.py` | 读取本地文件 |
-| `write_file` | `file_io.py` | 写入本地文件 |
-| `edit_file` | `file_io.py` | 编辑本地文件（精确替换） |
-| `grep_search` | `file_search.py` | 正则搜索文件内容 |
-| `glob_search` | `file_search.py` | Glob 模式搜索文件 |
-| `browser_use` | `browser_control.py` | Playwright 浏览器自动化 |
-| `desktop_screenshot` | `desktop_screenshot.py` | mss 截取屏幕图像 |
-| `send_file_to_user` | `send_file.py` | 向用户发送文件 |
-| `get_current_time` | `get_current_time.py` | 获取当前时间 |
-| `memory_search` | `memory_search.py` | 语义检索长期记忆（条件注册） |
+`src/qwenpaw/app/workspace/workspace.py`。每个实例通过 `ServiceManager` 登记服务：
 
-#### 生命周期钩子
+| 服务 | 工厂 / 类 | 职责 |
+|------|-----------|------|
+| session | `SafeJSONSession`（`app/chats/session.py`） | 会话状态落盘 |
+| memory_manager | `create_memory_manager_backend` | ReMe Light 或 `none` |
+| driver_manager | `create_driver_service` | MCP Drivers |
+| chat_manager | `create_chat_service` | 聊天列表 `chats.json` |
+| channel_manager | `create_channel_service` | 频道队列与收发 |
+| cron_manager | `CronManager` | 每工作区一份 jobs |
+| mail_monitor | `create_mail_monitor_service` | 邮件推送 |
+| agent_config_watcher | `create_agent_config_watcher` | `agent.json` 热重载 |
 
-| 钩子 | 触发时机 | 功能 |
-|------|----------|------|
-| `BootstrapHook` | `pre_reasoning` | 检查 `BOOTSTRAP.md` 是否存在且为首次对话，若是则将引导指令注入上下文 |
-| `MemoryCompactionHook` | `pre_reasoning` | 当 Token 用量超过 `max_input_length × MEMORY_COMPACT_RATIO`（默认 0.7）时，保留最近 N 条消息（默认 3），压缩其余为摘要 |
+`Workspace.stream_query(request)`：
 
-钩子签名：
+- `backend == "qwenpaw"`（默认）→ `Runtime(workspace, app_services).run(request)`
+- 其它 backend（`codex` / `qoder`）→ `HarnessRuntime.stream(...)`
+
+#### AppServiceManager
+
+`src/qwenpaw/app/app_services/`。**仅**跨工作区三件套：`task_tracker`、`ToolCoordinator`（HITL 工具协调）、`ApprovalCoordinator`。工具注册表、钩子、斜杠命令、Mode 一律在 `Workspace.plugins`（`WorkspacePlugins`），禁止放进 AppServiceManager。
+
+#### 启动顺序（`_app.py` lifespan）
+
+快路径（目标尽快听 HTTP）：
+
+1. 清理备份恢复残留；环境自动注册；代理配置检查
+2. 遗留工作区 / Skills 迁移；确保 `default` 与 QA Agent 存在
+3. PawPort 中断事务恢复；Scroll 历史回填 `sync_all_scroll_agents`
+4. `ProviderManager` / `LocalModelManager`
+5. `AppServiceManager.start()` + `WorkspaceRegistry`
+6. `@api_action` HTTP / 斜杠命令收集；HITL 工具命令
+7. `WorkspaceBootstrapFactory.build_bootstrap_kwargs()` 注入内置工具 / 命令 / 钩子 / Mode
+8. `BackupManager`、`TokenUsageManager`、Browser kernel watchdog
+9. `yield`（后台任务继续加载智能体与插件）
+
+后台：`PluginLoader` **phase 1**（`channel` + `memory`）→ `start_all_configured_agents` → Provider 模型同步 → **phase 2** 其余插件 → 插件启动钩子 → Approval 绑定默认频道 → Skill Pool 自动化。
+
+停止（`finally`）：取消后台启动 → PawPort 导入任务 → Backup → Browser → 插件 shutdown 钩子 → 本地模型服务 → `AppServiceManager.stop()` → `MultiAgentManager.stop_all()` → TokenUsage / Hub HTTP 客户端 → Windows 沙箱残留清理。
+
+---
+
+### 5.2 Runtime 与 QwenPawAgent
+
+#### Runtime 八阶段
+
+`src/qwenpaw/runtime/runtime.py`、`phases.py`。一次 `AgentRequest` 对应一次 `run()`，产出与旧 `Runner.stream_query` 兼容的 SSE 信封。
+
+固定步骤夹在阶段之间：**斜杠命令分发**、**AgentBuilder.build**、**AgentExecutor.run**。
+
+| Phase | 含义 |
+|-------|------|
+| `PRE_DISPATCH` | 规范化之后、斜杠分发之前 |
+| `POST_DISPATCH` | 未命中斜杠命令 |
+| `PRE_AGENT_BUILD` | 组 Agent 前（session.load 等） |
+| `POST_AGENT_BUILD` | Agent 已构造，注入 Mode 上下文 |
+| `PRE_EXECUTE` | bootstrap / 提示词刷新 |
+| `POST_RESPONSE` | session.save、cron 回写 |
+| `ON_ERROR` | 异常规范化、取消信封 |
+| `FINALLY` | 幂等清理（关 MCP 作用域、复位 ContextVars） |
+
+这些是 **Runtime 编排钩子**（`runtime/hooks.py` 的 `HookRegistry`），与 AgentScope `middleware`（包一层 `reply`）正交。
+
+实现目录：`src/qwenpaw/hooks/`（`BootstrapHook`、`MediaProcessHook`、`CronContextHook`、`ErrorNormalizeHook`、session / skill_env / langfuse 等）。旧的 `agents/hooks/memory_compaction.py` 已不存在，长上下文由 Scroll 承担。
+
+#### AgentBuilder
+
+`src/qwenpaw/runtime/builder.py`。**每个请求**组装 `QwenPawAgent`：工具来自 `QwenPawLocalWorkspace.list_tools()`，系统提示来自 `PromptManager`，模型来自 `model_factory`。Agent **不再**在 `__init__` 内部自己建 Toolkit。
+
+#### QwenPawAgent
+
+`src/qwenpaw/agents/react_agent.py`：
 
 ```python
-async def __call__(self, agent, kwargs: dict[str, Any]) -> dict[str, Any] | None
+class QwenPawAgent(CodingModeMixin, Agent):
+    def __init__(self, *, name, model, system_prompt, toolkit,
+                 react_config, middlewares, agent_config,
+                 workspace_dir=None, request_context=None,
+                 offloader=None, context_config=None,
+                 context_manager=None, effective_skills=None,
+                 governor=None):
+        ...
 ```
 
-#### 系统提示词构建
+继承 AgentScope 2.0 的 `Agent`（不是 1.x 的 `ReActAgent` 子类直接堆工具）。`context_manager` 可注入 `ScrollContextManager`。工具权限走 `PolicyGuardedTool` / `governor`。
 
-`PromptBuilder` 按 `PromptConfig` 定义的顺序加载 Markdown 文件并拼接：
+懒加载仍在 `agents/__init__.py`：`from qwenpaw.agents import QwenPawAgent` 才导入 `react_agent`。
 
-```
-加载顺序: AGENTS.md → SOUL.md → PROFILE.md
-来源目录: working_dir/md_files/ (用户自定义优先)
-回退目录: agents/md_files/en/ 或 agents/md_files/zh/ (内置模板)
-```
+#### 系统提示词
 
-### 5.2 应用层（App Layer）
+`runtime/prompt_contributors.py` 默认文件顺序：`AGENTS.md` → `SOUL.md` → `PROFILE.md`。优先读工作区，回退 `agents/md_files/<lang>/`。`PromptManager` 按 contributor `priority` 拼接。
 
-**`_app.py`** 是 FastAPI 应用的入口，通过 `lifespan` 上下文管理器管理所有组件的生命周期。
+#### 内置工具（`agents/tools/`）
 
-#### 启动顺序
+通过 `@tool_descriptor` 在 import 时登记；`discover_builtin_tool_funcs()` 收集。`tools/__init__.py` 显式 import 以触发装饰器：
 
-```
-1. AgentRunner.start()                → 初始化 Agent 运行环境
-2. MCPClientManager.init_from_config() → 建立 MCP 服务连接
-3. ChannelManager.from_config()       → 构造频道实例
-4. ChannelManager.start_all()         → 创建队列 + 启动 Worker + 启动频道
-5. CronManager.start()               → 加载任务 + 启动 APScheduler
-6. ChatManager 初始化                 → 绑定 Runner
-7. ConfigWatcher.start()              → 启动 config.json 监听
-8. MCPConfigWatcher.start()           → 启动 MCP 配置监听
-```
+| 工具 | 文件 |
+|------|------|
+| `read_file` / `write_file` / `edit_file` / `append_file` | `file_io.py` |
+| `grep_search` / `glob_search` | `file_search.py` |
+| `execute_shell_command` | `shell.py` |
+| `send_file_to_user` | `send_file.py` |
+| `web_search` / `web_fetch` | `web_search.py` |
+| `desktop_screenshot` | `desktop_screenshot.py` |
+| `view_image` / `view_video` | `view_media.py` |
+| `get_current_time` / `set_user_timezone` | `get_current_time.py` |
+| `get_token_usage` | `get_token_usage.py` |
+| `list_agents` / `chat_with_agent` / `submit_to_agent` / `check_agent_task` / `spawn_subagent` | `agent_management.py` |
+| `delegate_external_agent` | `delegate_external_agent.py` |
+| `ast_search` | `ast_tool.py` |
+| `run_tool_batch` | `run_tool_batch.py` |
+| `activate_f1_exploration_mode` | `mail_f1_tool.py` |
+| `browser` | `browser.py`（`browser.experimental=true`）或 `deprecated_browser/browser_control.py` |
+| `migration_compat_*` | `migration_compatibility.py`（PawPort） |
 
-#### 停止顺序（在 finally 块中反向执行）
+Coding Mode 额外：`lsp`（`lsp_tool.make_lsp_tool`）、`ast_search` 由 `modes/coding/mixin.py` 的 `collect_coding_tools()` 注入。Scroll 的 `recall_history` 在上下文策略里注册，治理类型为 `internal`。
 
-```
-1. ConfigWatcher.stop()
-2. MCPConfigWatcher.stop()
-3. CronManager.stop()
-4. ChannelManager.stop_all()
-5. MCPClientManager.close_all()
-6. AgentRunner.stop()
-```
+#### 斜杠命令
 
-#### App State 共享
+`runtime/slash_command_registry.py` + `runtime/builtin_commands.py`；插件与 `@api_action` 可追加。命中则跳过 Agent。旧 1.x 的 `CommandHandler`（`/compact` 等）已拆到 Runtime 命令注册表与 Scroll 策略。
 
-通过 `app.state` 将核心组件注入 FastAPI 上下文，各路由通过 `request.app.state` 访问：
-
-```python
-app.state.runner          # AgentRunner
-app.state.channel_manager # ChannelManager
-app.state.cron_manager    # CronManager
-app.state.chat_manager    # ChatManager
-app.state.mcp_manager     # MCPClientManager
-app.state.config_watcher  # ConfigWatcher
-app.state.mcp_watcher     # MCPConfigWatcher
-```
-
-#### 辅助内存存储
-
-| 存储 | 文件 | 用途 |
-|------|------|------|
-| `DownloadTaskStore` | `download_task_store.py` | 模型下载任务状态跟踪（llamacpp/mlx/ollama 共用） |
-| `ConsolePushStore` | `console_push_store.py` | Console 频道推送消息缓存（Cron 结果、下载完成通知等） |
-
-`ConsolePushStore` 限制：最多 500 条消息，超过 60 秒自动过期，前端通过 `/api/console/push-messages` 轮询获取。
+---
 
 ### 5.3 频道系统（Channels）
 
-频道系统采用**注册表 + 队列 + Worker** 模式，支持内置频道和自定义频道。
+模式未变：**注册表 + 队列 + 消费**，但队列实现换成按会话的按需消费者。
 
-#### BaseChannel 抽象基类
+#### BaseChannel
 
-```python
-class BaseChannel(ABC):
-    channel: ChannelType          # 频道类型标识符
-    uses_manager_queue: bool = True  # 是否使用 Manager 的异步队列
+`src/qwenpaw/app/channels/base.py`：`channel`、`uses_manager_queue`、`from_config()`、`build_agent_request_from_native()`、`send()` / `send_event()`、`start()` / `stop()`、防抖合并。
 
-    def __init__(self, process: ProcessHandler,
-                 on_reply_sent: OnReplySent = None,
-                 show_tool_details: bool = True)
+#### 注册表
 
-    # 工厂方法
-    @classmethod
-    def from_config(cls, process, config, on_reply_sent, show_tool_details) -> Self
+`src/qwenpaw/app/channels/registry.py` 的 `_BUILTIN_SPECS`（**console 为必加载**；其它依赖失败只打 debug，不拖垮 CLI）：
 
-    # 消息处理
-    def build_agent_request_from_native(self, native_payload) -> AgentRequest
-    def resolve_session_id(self, sender_id, channel_meta) -> str
-    async def consume_one(self, payload) -> None
+| key | 类 |
+|-----|-----|
+| `console` | `ConsoleChannel` |
+| `dingtalk` | `DingTalkChannel` |
+| `feishu` | `FeishuChannel` |
+| `qq` | `QQChannel` |
+| `discord` | `DiscordChannel` |
+| `imessage` | `IMessageChannel` |
+| `telegram` | `TelegramChannel` |
+| `mattermost` | `MattermostChannel` |
+| `mqtt` | `MQTTChannel` |
+| `matrix` | `MatrixChannel` |
+| `slack` | `SlackChannel` |
+| `voice` | `VoiceChannel` |
+| `sip` | `SIPChannel` |
+| `wecom` | `WecomChannel` |
+| `xiaoyi` | `XiaoYiChannel` |
+| `yuanbao` | `YuanbaoChannel` |
+| `wechat` | `WeChatChannel` |
+| `onebot` | `OneBotChannel` |
 
-    # 发送（子类实现）
-    @abstractmethod
-    async def send(self, to_handle, text, meta) -> None
-    async def send_content_parts(self, to_handle, parts, meta) -> None
-    async def send_event(self, *, user_id, session_id, event, meta) -> None
+`get_channel_registry()` = 内置 + `PluginRegistry.get_registered_channels()`。**不再扫描 `custom_channels/` 目录。** 配置侧 `ChannelConfig`（`config/config.py`）字段与上表一致；遗留 `weixin` 键会迁到 `wechat`。
 
-    # 消息防抖与合并
-    _debounce_seconds: float
-    def get_debounce_key(self, payload) -> str
-    def merge_native_items(self, items) -> Any
-    def merge_requests(self, requests) -> AgentRequest
+频道过滤：`QWENPAW_ENABLED_CHANNELS` / `QWENPAW_DISABLED_CHANNELS`（Docker 默认禁用 `imessage`）。
 
-    # 生命周期
-    async def start(self) -> None
-    async def stop(self) -> None
-```
+#### ChannelManager 与队列
 
-#### 频道注册表
+`manager.py` + `unified_queue_manager.py`：
 
-```python
-BUILTIN_CHANNELS = {
-    "console":  ConsoleChannel,
-    "dingtalk": DingTalkChannel,
-    "feishu":   FeishuChannel,
-    "qq":       QQChannel,
-    "discord":  DiscordChannel,
-    "imessage": IMessageChannel,
-}
-```
+- 每个 `QueueKey` 队列 `maxsize=1000`（不是每频道共享一条）
+- `QueueKey = (channel_id, session_id, priority_level)`
+- **按需创建 consumer Task**，无固定「每频道 4 Worker」池
+- 同 key 串行；不同 session / 优先级可并行
+- 空闲队列超时回收（默认 600s）
+- `enqueue` 线程安全；`replace_channel` 热替换
 
-自定义频道从 `working/custom_channels/` 目录通过 `_discover_custom_channels()` 动态发现并注册。
+处理路径：`enqueue` → 防抖合并 → `build_agent_request_from_native` → `Workspace.stream_query` → `send_event` / `MessageRenderer`。
 
-可通过 `COPAW_ENABLED_CHANNELS` 环境变量筛选可用频道。
+`session_id` 由频道自定义。默认形态接近 `{channel}:{user}`，但飞书实际是短后缀：群 `{app_id后4}_{chat_id后8}`，单聊 `open_id` 后 8 位。`feishu:chat_id:<id>` / `feishu:open_id:<id>` 是发送地址 `to_handle`，不是 session_id。详情见 `docs/FeishuChannel详解.md`。
 
-#### ChannelManager 队列消费模型
-
-```
-ChannelManager
-├── 每频道 1 个 asyncio.Queue（maxsize=1000）
-├── 每频道 4 个 Worker 协程消费队列
-├── 线程安全入队 enqueue(channel_id, payload)
-├── 消息防抖与合并（相同 session_id 的连续消息）
-│   ├── _in_progress[key] 标记正在处理
-│   └── _pending[key] 合并等待中的消息
-└── 方法:
-    ├── start_all()                → 创建队列 + 启动 Worker + 启动频道
-    ├── stop_all()                 → 取消 Worker + 清空队列 + 停止频道
-    ├── replace_channel(new)       → 热替换频道实例（配置变更时）
-    ├── send_event(channel, ...)   → 向指定频道发送事件
-    └── send_text(channel, ...)    → 向指定频道发送文本（Cron 用）
-```
-
-#### 各频道实现
-
-| 频道 | 类 | 传输层 | 接收方式 | 发送方式 | 特殊说明 |
-|------|-------|--------|----------|----------|----------|
-| Console | `ConsoleChannel` | HTTP/SSE | API 请求 → 队列 | stdout + ConsolePushStore | 前端轮询推送消息 |
-| 钉钉 | `DingTalkChannel` | dingtalk-stream | Stream 回调 → 队列 | sessionWebhook | 维护 webhook 存储；DingTalk Markdown 格式转换 |
-| 飞书 | `FeishuChannel` | lark-oapi WebSocket | WS 消息 → 队列 | Open API 发送 | session_id 格式 `feishu:chat_id:<id>` 或 `feishu:open_id:<id>` |
-| Discord | `DiscordChannel` | discord.py | `on_message` → 队列 | `channel.send()` | 异步事件驱动 |
-| iMessage | `IMessageChannel` | macOS 原生 | 轮询 `~/Library/Messages/chat.db` | AppleScript 发送 | 仅 macOS 可用 |
-| QQ | `QQChannel` | WebSocket + HTTP | WS OP_DISPATCH → 队列 | HTTP API | 需要维护心跳 (OP_HEARTBEAT) |
-
-#### 消息渲染
-
-`MessageRenderer` 根据 `RenderStyle` 将 Agent 输出转换为频道适配的格式：
-
-```python
-class RenderStyle:
-    show_tool_details: bool    # 是否显示工具调用详情
-    supports_markdown: bool    # 是否支持 Markdown
-    supports_code_fence: bool  # 是否支持代码块
-    use_emoji: bool            # 是否使用 emoji
-```
-
-#### 消息路由流
-
-```
-外部频道消息
-    ↓
-Channel.enqueue(native_payload)
-    ↓
-ChannelManager 异步队列
-    ↓
-Worker 消费 → Channel.consume_one(payload)
-    ↓
-build_agent_request_from_native(payload)
-    ↓ (防抖 & 合并)
-AgentRunner.stream_query(request)
-    ↓
-CoPawAgent.reply(messages)
-    ↓
-Channel.send_event(event) → 渲染 + 发送到外部频道
-```
+---
 
 ### 5.4 Skills 系统
 
-Skills 是 CoPaw 的**插件扩展机制**，每个 Skill 以 **SKILL.md 文件**（而非代码）定义能力。
+Skills 仍是 **YAML front matter + Markdown 指令**，不是 Python 插件。实现在 `agents/skill_system/`，不再使用 1.x 的 `customized_skills/` + `active_skills/` 三层（启动时 `migrate_legacy_skills_to_skill_pool`）。
 
-#### Skill 定义格式（SKILL.md）
+#### 存储
 
-```markdown
+| 层 | 路径 | 角色 |
+|----|------|------|
+| 内置 | `src/qwenpaw/agents/skills/<name>-<lang>/SKILL.md` | 随包分发 |
+| 全局池 | `{WORKING_DIR}/skill_pool/` + `skill.json` | `SkillPoolService`；可配置额外只读 `skill_paths` |
+| 工作区 | `{workspace}/skills/` + `{workspace}/skill.json` | Agent 实际启用集；`SkillService` |
+
+`get_workspace_skills_dir()` 会把遗留目录名 `skill/` 重命名为 `skills/`。
+
+Front matter 命名空间兼容 `qwenpaw` / `openclaw` / `clawdbot`。安装前走 `security/skill_scanner`。
+
+#### 内置 Skills（源码目录，成对 `-zh`/`-en`）
+
+`browser`、`cron`、`dingtalk_channel`、`docx`、`xlsx`、`pptx`、`pdf`、`file_reader`、`mailbox`、`channel_message`、`chat_with_agent`、`multi_agent_collaboration`、`make-skill`、`make_plan`、`guidance`、`QA_source_index`。
+
+1.x 的 `himalaya` / `news` / `browser_visible` 等已不在内置目录。
+
+Hub 安装：`agents/skill_system/hub.py`（lifespan 关闭时 `aclose_hub_client`）。
+
+启动后 `run_pool_automation_pipeline()` 做池更新与工作区自动同步。
+
 ---
-name: skill_name
-description: "何时使用此 Skill 的说明..."
-metadata:
-  copaw:
-    emoji: "🖥️"
-    requires: {}
----
-
-# Skill 标题
-
-此处为 Markdown 格式的详细指令，将被注入 Agent 的上下文中。
-Agent 在判断需要此能力时，自动引用这些指令。
-```
-
-#### Skill 目录结构
-
-```
-skills/<skill_name>/
-├── SKILL.md          # 必需：YAML front matter + Markdown 指令
-├── references/       # 可选：参考文档
-├── scripts/          # 可选：辅助脚本
-└── assets/           # 可选：资源文件
-```
-
-#### Skills 三层存储 & 同步
-
-```
-┌─────────────────────────────────┐
-│ builtin skills                  │  src/copaw/agents/skills/
-│ (内置 Skills，随代码分发)        │
-└─────────┬───────────────────────┘
-          │ sync_skills_to_working_dir()
-          ▼
-┌─────────────────────────────────┐
-│ customized_skills               │  working_dir/customized_skills/
-│ (用户创建/Hub 安装的 Skills)     │  同名自定义 Skill 覆盖内置
-└─────────┬───────────────────────┘
-          │ enable_skill() / disable_skill()
-          ▼
-┌─────────────────────────────────┐
-│ active_skills                   │  working_dir/active_skills/
-│ (Agent 实际加载的 Skills)        │  CoPawAgent 只从此目录加载
-└─────────────────────────────────┘
-```
-
-#### SkillService（skills_manager.py）
-
-| 方法 | 功能 |
-|------|------|
-| `list_all_skills()` | 列出 builtin + customized 所有 Skills |
-| `list_available_skills()` | 列出 active_skills 中的 Skills |
-| `create_skill(name, content, ...)` | 在 customized_skills 中创建 Skill |
-| `enable_skill(name)` | 同步到 active_skills |
-| `disable_skill(name)` | 从 active_skills 移除 |
-| `delete_skill(name)` | 从 customized_skills 删除 |
-
-#### Skills Hub（skills_hub.py）
-
-支持多个在线 Skill 源：
-
-| 源 | 说明 |
-|----|------|
-| ClawHub | 官方 Skills 仓库 |
-| Skills.sh | 社区 Skills |
-| GitHub | 直接从 GitHub 仓库安装 |
-| SkillsMP | Skills 市场 |
-
-```python
-install_skill_from_hub(bundle_url, version, enable, overwrite)
-```
-
-#### 内置 Skills 列表
-
-| Skill | 功能 |
-|-------|------|
-| `browser_visible` | 可视化浏览器操作（Playwright） |
-| `cron` | 定时任务管理指令 |
-| `dingtalk_channel` | 钉钉频道特有操作 |
-| `docx` | Word 文档处理 |
-| `file_reader` | 文件读取增强 |
-| `himalaya` | 邮件客户端 |
-| `news` | 新闻摘要获取 |
-| `pdf` | PDF 文档处理 |
-| `pptx` | PPT 处理 |
-| `xlsx` | Excel 处理 |
 
 ### 5.5 定时任务系统（Crons）
 
-#### 核心架构
+仍在 `src/qwenpaw/app/crons/`：**每个 Workspace 一份 `CronManager`**（不再挂在全局 AgentRunner 上）。
 
 ```
 CronManager
-├── APScheduler (后端调度器)
-│   └── 支持 cron 表达式
-├── CronExecutor
-│   ├── task_type == "text"  → ChannelManager.send_text()
-│   └── task_type == "agent" → AgentRunner.stream_query() + send_event()
-├── HeartbeatTask
-│   ├── 解析 HEARTBEAT.md 获取心跳指令
-│   ├── 默认间隔: 30m（通过 heartbeat_every 配置）
-│   └── 目标: "main" (主频道) 或 "last" (最后活跃频道)
-└── JsonJobRepository
-    └── 持久化存储到 working_dir/jobs.json
+├── APScheduler
+├── CronExecutor  → workspace.stream_query() 或 ChannelManager.send_text()
+├── HeartbeatTask → 读 HEARTBEAT.md，默认间隔 6h
+└── JsonJobRepository → 工作区 jobs.json
 ```
 
-#### 任务数据模型
+`CronJobSpec.task_type`：`"text"` | `"agent"`。心跳目标：`main` / `last` / `inbox`（常量 `HEARTBEAT_TARGET_*`）。超时默认 300s，上限 3600s。
 
-```python
-CronJobSpec:
-    id: str                        # 任务 ID
-    name: str                      # 任务名称
-    enabled: bool                  # 是否启用
-    schedule: ScheduleSpec         # 调度配置（cron 表达式 + 时区）
-    task_type: "text" | "agent"    # 任务类型
-    text: str | None               # text 模式的消息内容
-    request: CronJobRequest | None # agent 模式的请求参数
-    dispatch: DispatchSpec         # 分发配置（频道 + 目标用户）
-    runtime: JobRuntimeSpec        # 运行参数（并发/超时/容错）
-    meta: dict                     # 扩展元数据
-```
+---
 
-#### 任务执行流
+### 5.6 Drivers（MCP 等外部能力）
 
-```
-APScheduler 触发
-    ↓
-CronExecutor.execute(job: CronJobSpec)
-    ↓
-    ├── task_type == "text":
-    │   └── ChannelManager.send_text(channel, user_id, session_id, text)
-    │
-    └── task_type == "agent":
-        ├── AgentRunner.stream_query(request)
-        │   └── CoPawAgent 执行推理
-        └── ChannelManager.send_event(channel, user_id, session_id, event)
-```
+`src/qwenpaw/drivers/`。`DriverManager` 在生命周期边界上协议中立：登记 `DriverHandler` 类型、持久化 `DriverCard`、加密凭据、`ApprovalGate`、按次调用策略。
 
-#### 心跳任务
+**当前注册的协议只有 `mcp`**（`create_driver_service` → `MCPDriverHandler`）。源码注释写明 ACP/A2A 可作为后续协议扩展能力模型；**仓库里没有 A2A `DriverHandler` 实现**。ACP 走独立子系统（§5.14），不是 Driver 协议插件。
 
-```
-HEARTBEAT.md (工作目录中的心跳指令文件)
-    ↓
-HeartbeatTask.run_heartbeat_once()
-    ├── 读取 HEARTBEAT.md 内容作为 prompt
-    ├── 通过 AgentRunner 执行
-    └── 结果发送到 heartbeat_target 频道
-        ├── "main"  → 主频道
-        └── "last"  → 最后一次交互的频道（on_last_dispatch 回调）
-```
+遗留 MCP JSON 配置由 `drivers/adapters/mcp_legacy_config.py` 迁入 DriverCard 目录（`{workspace}/drivers/`），旧 `MCPClientManager` 运行时路径已去掉。`app/mcp/` 只保留 API schema 与 `config_service`。`MCPConfigWatcher` 对应现实现为 `app/driver_config_watcher.py`（按工作区）。
 
-### 5.6 MCP 集成
+邮件 MCP：`app/mail/driver_config.py` 同步托管 `qwenpawmail.yaml` 卡片。
 
-**MCP（Model Context Protocol）** 客户端管理器提供对外部 MCP 服务的接入。
+调用：Agent 工具层通过 `drivers/adapters/agentscope_tool.py` 把 Driver capability 暴露给 Toolkit；策略拒绝会返回 `driver_policy_denied`（系统提示里要求下一轮按最新策略重试）。
 
-```
-MCPClientManager
-├── init_from_config(config: MCPConfig)
-│   └── 读取 MCP 服务配置，创建 StdIOStatefulClient 连接
-├── get_clients() → 返回活跃的 MCP 客户端列表
-├── replace_client(key, config, timeout)
-│   └── 热替换单个 MCP 客户端
-├── remove_client(key) → 移除 MCP 客户端
-└── close_all() → 关闭所有连接
-
-MCPConfigWatcher
-├── poll_interval: 2.0s
-├── 基于 mtime + hash 检测配置变更
-├── 变更时在后台异步重载受影响的客户端
-└── 每个客户端有重试限制
-```
-
-MCP 工具注册到 Agent 的流程：
-
-```
-MCPClientManager.get_clients()
-    ↓
-CoPawAgent.register_mcp_clients()
-    ↓
-toolkit.register_mcp_client(client)  # 对每个 MCP 客户端
-    ↓
-AgentScope 自动发现 MCP 服务暴露的工具列表
-    ↓
-工具可在 ReAct 循环中被 LLM 调用
-```
+---
 
 ### 5.7 配置管理
 
-#### Config Pydantic 模型
+#### 全局 `Config`（`config.json`）
 
-`Config` 是系统的统一配置数据结构，定义在 `config/config.py` 中。
+`src/qwenpaw/config/config.py` 根模型字段包括：`channels`、`mcp`、`tools`、`last_api`、`agents`、`last_dispatch`、`security`、`acp`、`browser`、`show_tool_details`、`user_timezone`、`plugins`、`skill_paths`。
 
-#### 配置文件体系
+`AgentsConfig`：`active_agent`、`profiles`（id → `workspace_dir` 等）。
 
-| 文件 | 内容 | 管理类 |
-|------|------|--------|
-| `config.json` | 主配置（频道设置、Agent 参数、心跳配置） | ConfigWatcher |
-| `providers.json` | LLM 提供商及模型配置 | ProviderStore |
-| `envs.json` | 环境变量（API Key 等，加密存储） | EnvManager |
-| `jobs.json` | 定时任务持久化 | JsonJobRepository |
-| `chats.json` | 聊天会话历史 | JsonChatRepository |
+#### 每智能体 `agent.json`
 
-#### 配置热重载
+`AgentProfileConfig`：运行参数、记忆后端、`LoopConfig`、`CodingModeConfig`、模型槽位 / LLM 路由、邮件、backend（`qwenpaw` | harness id）等。`load_agent_config(agent_id)` 带缓存与指纹；写盘仍走原子替换。
 
-```
-ConfigWatcher (基于 FSEvents/inotify 文件系统事件)
-    ↓ 检测到 config.json 变更
-    ↓
-重新加载 Config (Pydantic 验证)
-    ↓
-通知 ChannelManager:
-    ├── 对比变更的频道配置
-    ├── replace_channel(new_channel)  # 热替换变更的频道
-    └── 无需重启服务
+热重载：`AgentConfigWatcher`（工作区服务）+ 全局 `config/watcher.py`。频道变更由该工作区 `ChannelManager.replace_channel`。
 
-MCPConfigWatcher (轮询模式, 2s 间隔)
-    ↓ 检测到 MCP 配置变更 (mtime + hash)
-    ↓
-MCPClientManager.replace_client(key, new_config)
-    ↓
-重新注册 MCP 工具到 Agent
-```
+敏感值：`SECRET_DIR`（默认 `{WORKING_DIR}.secret`）+ keyring（`QWENPAW_KEYRING_ACCOUNT`）。
+
+---
 
 ### 5.8 LLM 提供商系统（Providers）
 
-#### 架构
+`ProviderManager`（单例）+ `providers/provider_catalog.py` 的 `BUILTIN_PROVIDERS`，包括但不限于：
 
-```
-ProviderRegistry                     # 内置提供商注册表
-├── DashScope (阿里云百炼)
-├── OpenAI
-├── 自定义 OpenAI 兼容提供商
-└── 本地模型 (llama.cpp / MLX)
+QwenPaw Local、Ollama、LM Studio、OpenRouter、GitHub Models、ModelScope、DashScope、阿里云 Coding/Token Plan（国内/国际）、OpenCode、Kilo、OpenAI / OpenAI Response、Azure OpenAI、Anthropic、Gemini、DeepSeek、Kimi（国内/国际/Coding Plan）、MiniMax、智谱、SiliconFlow、Volcengine、小米 MiMo 等。
 
-ProviderStore                        # 持久化层
-├── 加载/保存 providers.json
-├── 提供商 CRUD 操作
-└── 活跃模型管理 (active model)
+插件可通过 `PluginRegistry` 注册额外 Provider。启动时同步目录与本地模型 resume。支持 fallback 链（`fallback_chat_model.py`）与限流（`rate_limiter.py`）。
 
-OllamaModelManager                   # Ollama 专用管理器
-├── 列出本地 Ollama 模型
-├── 拉取 (下载) 模型
-├── 删除模型
-└── 通过 DownloadTaskStore 跟踪下载进度
-```
+控制台 / CLI `qwenpaw models` 走 `/api/models`。
 
-#### 模型选择流程
-
-```
-Web 控制台 / CLI 设置 active model
-    ↓
-ProviderStore 保存到 providers.json
-    ↓
-AgentRunner 创建 CoPawAgent 时读取 active model
-    ↓
-model_factory.create_model_and_formatter()
-    ├── 根据 provider_id 匹配提供商
-    ├── 创建对应的 LLM Client
-    └── 增强 Formatter: 文件块支持 + 工具消息修正
-```
+---
 
 ### 5.9 本地模型支持
 
-CoPaw 支持在本地运行大型语言模型，通过三种方式实现：
+`src/qwenpaw/local_models/`：`LocalModelManager`、`LlamaCppBackend`、`download_manager.py`。模型文件目录 `DEFAULT_LOCAL_PROVIDER_DIR`（`WORKING_DIR/local_models`）。Ollama / LM Studio 作为远程兼容 Provider，不是 llama.cpp 进程内后端。
 
-| 方式 | 平台 | 依赖 | 管理路由 |
-|------|------|------|----------|
-| llama.cpp | 跨平台（CPU/GPU） | llama-cpp-python >=0.3.0 | `/api/local-models` |
-| MLX | Apple Silicon（M 系列芯片） | mlx-lm >=0.10.0 | `/api/local-models` |
-| Ollama | 跨平台（需安装 Ollama） | 系统级 Ollama | `/api/ollama-models` |
+下载任务仍由内存 store 跟踪（pending → downloading → completed / failed / cancelled）。API：`/api/local-models`。
 
-#### 本地模型使用流程
+---
 
-```
-copaw models --local            # 查看本地模型列表
-copaw models download <model>   # 下载模型
-    ↓
-DownloadTaskStore 跟踪下载进度
-    ↓
-LocalModelManager.load(model)   # 加载模型到内存
-    ↓
-注册为 Provider，与云端 LLM 统一接口
-    ↓
-CoPawAgent 通过 Provider 接口调用（透明切换）
-```
+### 5.10 记忆、Scroll 与上下文
 
-#### 下载任务状态机
+#### 长期记忆后端
 
-```
-PENDING → DOWNLOADING → COMPLETED
-                ↓
-             FAILED
-                ↓
-           CANCELLED
-```
+`memory_registry`（`agents/memory/base_memory_manager.py`，对外再导出 `qwenpaw.memory`）：
 
-### 5.10 记忆管理
+| id | 类 | 说明 |
+|----|-----|------|
+| `remelight` | `ReMeLightMemoryManager` | 默认；委托 ReMe 0.4 application/job |
+| `none` | `NoopMemoryManager` | 关闭长期记忆 |
 
-CoPaw 采用**双层记忆架构**：
+工作区配置的后端不可用时回退 `remelight`（`workspace.py` 的 `_MEMORY_BACKEND_FALLBACK`）。插件类型 `memory` 必须在 Workspace 启动前注册（lifespan phase 1）。
 
-#### 短期记忆（CoPawInMemoryMemory）
+主动记忆：`agents/memory/proactive/`（懒导出，避免与 `react_agent` 循环导入）。
 
-继承 AgentScope 的 `InMemoryMemory`，增加压缩摘要和消息标记过滤：
+工作区 Markdown：`AgentMdManager`；人设文件仍在工作区根 / `md_files`。
 
-```python
-class CoPawInMemoryMemory(InMemoryMemory):
-    async def get_memory(
-        mark=None,                    # 按标记过滤
-        exclude_mark=COMPRESSED,      # 排除已压缩的消息
-        prepend_summary=True,         # 是否在开头注入压缩摘要
-    ) -> list[Msg]
+#### Scroll（短上下文策略）
 
-    def get_compressed_summary() -> str  # 获取压缩摘要文本
-    def state_dict() -> dict             # 序列化（持久化用）
-    def load_state_dict(data) -> None    # 反序列化
-```
+`src/qwenpaw/agents/context/scroll/`：
 
-#### 长期记忆（MemoryManager）
+- `ScrollContextManager`：write-through 每一轮到耐久 `conversation_history`；超 token 阈值时保留尾部与当前轮，中间折叠进 `EvictionIndex`；continuation summary **只是状态缓存，不替代原文**
+- `history.py`：`HistoryStore`（SQLite）
+- `recall_tool.py`：`recall_history`（参数化 SQL）；`recall_history_python` 为沙箱内逃逸口
+- `sync.py`：启动时把旧 `sessions/*.json` 迁入 `history.db`
 
-基于 ReMe-AI 实现：
+1.x `CoPawInMemoryMemory` + `MemoryCompactionHook` 摘要压缩路径已由 Scroll 取代。
 
-```python
-class MemoryManager(ReMeFb):
-    # 存储后端: "auto" / "chroma" / "local"
-    # 环境变量: MEMORY_STORE_BACKEND
+另有 `agents/context/visual_compression/`（视觉压缩管线，打包字体 atlas）。
 
-    compact_memory()          # 压缩对话为长期记忆
-    summary_memory()          # 生成对话摘要
-    memory_search(query)      # 语义检索长期记忆
-    memory_get()              # 获取记忆内容
-    add_async_summary_task()  # 添加异步摘要任务
-    await_summary_tasks()     # 等待所有异步摘要完成
-```
+---
 
-#### 压缩触发机制
+### 5.11 Loop Engineering 与 Agent Mode
 
-```
-MemoryCompactionHook (pre_reasoning)
-    ↓
-计算当前 Token 用量
-    ↓
-超过阈值? (max_input_length × MEMORY_COMPACT_RATIO, 默认 0.7)
-    ├── 否 → 跳过
-    └── 是 ↓
-        保留系统提示词 + 最近 N 条消息 (MEMORY_COMPACT_KEEP_RECENT, 默认 3)
-        ↓
-        MemoryManager.compact_memory(older_messages)
-        ↓
-        标记旧消息为 COMPRESSED
-        ↓
-        压缩摘要存入 _compressed_summary
-        ↓
-        下次 get_memory(prepend_summary=True) 时注入
-```
+#### StopGate
 
-#### 记忆文件存储
+`src/qwenpaw/loop/`：`StopHandler` + 门控。`catalog.py` 供用户可编辑循环模式选用：
 
-```
-working_dir/
-├── md_files/          # Agent 工作文件（系统人设、任务笔记）
-│   ├── AGENTS.md      # Agent 行为指引
-│   ├── SOUL.md        # Agent 人格设定
-│   ├── PROFILE.md     # 用户画像
-│   └── BOOTSTRAP.md   # 首次启动引导（BootstrapHook 使用）
-└── memory/            # 长期记忆文件
-    └── *.md           # ReMe-AI 管理的结构化记忆条目
-```
+`IterationGate`、`DoomLoopGate`（重复检测）、`CompletionRubricGate` / `QualitativeRubricGate`、`TokenBudgetGate`、`TimeoutGate`、`ToolCallBudgetGate`、`BudgetGate`、`FileLoopGate` 等。
 
-#### 相关环境变量
+`LoopConfig`（写在 `agent.json`）：`iteration` / `doom_loop` / `rubric` / `goal` / `mission` / `custom_modes`（最多 20，斜杠命令唯一）。
 
-| 环境变量 | 默认值 | 说明 |
-|---------|--------|------|
-| `COPAW_MEMORY_COMPACT_KEEP_RECENT` | 3 | 压缩时保留最近消息数 |
-| `COPAW_MEMORY_COMPACT_RATIO` | 0.7 | 压缩触发阈值比例 |
-| `ENABLE_MEMORY_MANAGER` | true | 是否启用长期记忆管理器 |
-| `MEMORY_STORE_BACKEND` | auto | 记忆存储后端（auto/chroma/local） |
+#### AgentMode
 
-### 5.11 Runner 与会话管理
+`src/qwenpaw/modes/`：每个 Mode 打包命令、工具、钩子、提示词片段。
 
-#### AgentRunner
+| Mode | 包 | 行为 |
+|------|-----|------|
+| `coding` | `modes/coding/` | LSP/AST、项目目录注入、`CodingModeMixin` |
+| `mission` | `modes/mission/` | `/mission`，故事迭代 + MissionGate |
+| `goal` | `modes/goal/` | `/goal`，直到 rubric 满足 |
+| `custom_loop` | `modes/custom_loop/` | 用户从内置门组合 |
+| `default` | `modes/default/` | 默认聊天循环 |
 
-继承 agentscope-runtime 的 `Runner`，负责管理 Agent 生命周期和查询处理：
+`WorkspacePlugins.register_mode()` 拒绝重名。`Runtime._start_modes` 在 POST_AGENT_BUILD 附近激活。
 
-```python
-class AgentRunner(Runner):
-    # 核心处理器
-    query_handler(msgs, request, **kwargs)
-        ├── load_session_state(session_id)
-        ├── CoPawAgent.reply(msgs)         # 流式输出
-        └── save_session_state(session_id)
+---
 
-    # 生命周期
-    init_handler()
-        ├── SafeJSONSession 初始化
-        └── MemoryManager 初始化
-    shutdown_handler()
-        └── memory_manager.close()
+### 5.12 治理、沙箱与安全
 
-    # 绑定
-    set_chat_manager(chat_manager)
-    set_mcp_manager(mcp_manager)
-```
+#### Governance
 
-#### SafeJSONSession
+`src/qwenpaw/governance/`：`ResourceGovernor`、`GovernanceAction`（`allow` / `deny` / `ask` / `sandbox_fallback`）。双层规则：`builtin_rules`（不可被 Agent 改）+ `user_rules`。评估：ToolRegistry 类型 → builtin → user → 全局回退。批准时可泛化规则（高危命令保持精确匹配）。工具包装：`PolicyGuardedTool`。
 
-继承 AgentScope 的 `JSONSession`，增加跨平台文件名安全处理：
+#### Sandbox
 
-```python
-class SafeJSONSession(JSONSession):
-    def sanitize_filename(name: str) -> str
-        # 替换 \ / : * ? " < > | 为 --
-        # 确保 Windows/macOS/Linux 兼容
-```
+`src/qwenpaw/sandbox/`：**每次工具调用创建、用完销毁**。
 
-#### ChatManager
+| 模式 | 实现 |
+|------|------|
+| `SEATBELT` | `macos_sandbox.py`（sandbox-exec） |
+| `BUBBLEWRAP` | `bubblewrap_sandbox.py`（Linux 首选） |
+| `LANDLOCK` | Linux 5.13+ 回退 |
+| `WINDOWS` | AppContainer / Elevated / Unelevated |
+| `NONE` | 直跑 |
 
-管理聊天会话列表（不管理消息内容，消息由 Session 管理）：
+进程退出时 Windows 路径会 `shutdown_all_sandboxes()`。
 
-```python
-class ChatManager:
-    list_chats(user_id, channel)        # 列出聊天
-    get_chat(chat_id)                   # 获取聊天详情
-    get_or_create_chat(session_id, ...) # 获取或创建聊天
-    create_chat(spec)                   # 创建聊天
-    update_chat(spec)                   # 更新聊天
-    delete_chats(chat_ids)              # 删除聊天
-    count_chats(...)                    # 统计聊天数
-```
+#### Security 包
 
-#### 错误转储
+- `security/tool_guard/`：shell 危险命令、文件守护、规避检测
+- `security/skill_scanner/`：SKILL.md 签名规则（注入、外泄、供应链等）
+- `security/secret_store.py`：密钥存储
 
-`query_error_dump.py` 提供 `write_query_error_dump(request, exc, locals_)` 方法，在 Agent 执行出错时将完整上下文（请求、异常栈、Agent 状态）写入临时 JSON 文件用于调试。
+配置：`SecurityConfig`、`ToolGuardConfig`、`FileGuardConfig`、`SkillScannerConfig`。
+
+---
+
+### 5.13 插件与 PawApp
+
+#### Plugin 类型（`plugins/architecture.py`）
+
+`tool` / `provider` / `hook` / `command` / `channel` / `memory` / `frontend` / `app` / `general`。
+
+目录：`{WORKING_DIR}/plugins/`。`PluginLoader.load_all_plugins(types=[...])` 分阶段。PawApp 也装进同一目录，manifest 带 `meta.pawapp`，只在 App Center 展示。
+
+#### PawApp SDK
+
+`src/qwenpaw/pawapp/`：`PawApp` 包一层 `PluginApi`；`PawAppContext`（chat / storage / tools / ui）；`get_ctx` FastAPI 依赖；托管 Agent 档案与 ManagedService。
+
+市场：`app/routers/market.py`、`src/qwenpaw/market/`。
+
+---
+
+### 5.14 Hub、Harness 与 ACP
+
+#### Hub
+
+`src/qwenpaw/hub/` + `cli/hub_cmd.py`：`qwenpaw hub` 独立控制面。`HubService` 编排 `RuntimeRegistry` / `RuntimeProvisioner`（本地进程或 Docker extra）。含 OAuth 路由、WebSocket 代理、Windows 反向隧道与进程隔离。这是**多用户运行时托管**，与 Skills Hub 不是同一概念。
+
+#### Harness
+
+`src/qwenpaw/harnesses/`：工作区 `backend != "qwenpaw"` 时 `Workspace.stream_query` 转给 `HarnessRuntime`。`PROVIDER_CATALOG` 含 **codex**、**qoder**（缺依赖时 `MissingDependencyAdapter`）。事件映射到统一 `HarnessEvent`。
+
+#### ACP
+
+`src/qwenpaw/agents/acp/`：`ACPService` / `QwenPawACPAgent` 懒加载。CLI `qwenpaw acp`；TUI 可走 ACP transport（`cli/tui/transport/acp.py`）。`delegate_external_agent` 走 ACP 适配。全局 `Config.acp`。前端路由 `/acp`。
+
+---
+
+### 5.15 Browser-use 与 Computer-use
+
+#### Browser-use
+
+配置 `BrowserConfig`（`config.browser`）。`browser.experimental=true`（默认走实验轨）加载 `agents/tools/browser.py` + `src/qwenpaw/browser/`：subprocess 执行平面、`execution/kernel.py` 工作池、Playwright / Chrome CDP control_link、审批与治理错误码。lifespan 挂 idle watchdog，`discard_idle_workers`。`experimental=false` 回退 `deprecated_browser/browser_control.py`。
+
+#### Computer-use
+
+`src/qwenpaw/app/computer_use/`：`HostRuntimeProvider` 对接桌面宿主（**仅 win32 / darwin** 有原生 helper）。命名管道 / 控制口协议版本 `COMPUTER_USE_PROTOCOL_VERSION = 2`。请求钩子写入 `computer_use_turn_id`。无 helper 时 `RuntimeStatus.available` 为假，不假装全平台桌面控制。
 
 ---
 
 ## 6. API 接口设计
 
-所有 REST API 挂载在 `/api` 前缀下，由 FastAPI 路由层提供。
+REST 挂在 `/api`。`app/routers/__init__.py` 汇总全局路由；`create_agent_scoped_router()` 把同一套能力挂到 `/api/agents/{agentId}/...`。另有 `AgentContextMiddleware`、`AuthMiddleware`、`RuntimeBoundaryMiddleware`。
 
-### 根路由
+`DOCS_ENABLED`（`QWENPAW_OPENAPI_DOCS`）为真时才开 `/docs`。
 
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/` | SPA 入口页面（有 console 时）或 `{"message": "Hello World"}` |
-| GET | `/api/version` | 返回版本号 `{"version": "0.0.4b2"}` |
-
-### Agent API — `/api/agent`
+### 根路径
 
 | 方法 | 路径 | 功能 |
 |------|------|------|
-| GET | `/api/agent/files` | 列出工作文件 |
-| GET | `/api/agent/files/{name}` | 读取工作文件 |
-| PUT | `/api/agent/files/{name}` | 写入工作文件 |
-| GET | `/api/agent/memory` | 列出记忆文件 |
-| GET | `/api/agent/memory/{name}` | 读取记忆文件 |
-| PUT | `/api/agent/memory/{name}` | 写入记忆文件 |
-| GET | `/api/agent/running-config` | 获取 Agent 运行配置 |
-| PUT | `/api/agent/running-config` | 更新 Agent 运行配置 |
+| GET | `/` | Console SPA `index.html`（无构建则提示 npm build） |
+| GET | `/api/version` | `{"version": ...}` |
+| GET | `/api/healthz` | 健康检查（`routers/healthz.py`） |
 
-### 频道配置 API — `/api/config`
+### 路由前缀（实现文件）
 
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/api/config/channels` | 列出所有频道配置 |
-| GET | `/api/config/channels/types` | 列出支持的频道类型 |
-| PUT | `/api/config/channels` | 批量更新频道配置 |
-| GET | `/api/config/channels/{name}` | 获取特定频道配置 |
-| PUT | `/api/config/channels/{name}` | 更新特定频道配置 |
+| 前缀 | 模块 |
+|------|------|
+| `/agents` | `routers/agents.py` |
+| `/agents/{agentId}` | `routers/agent_scoped.py` |
+| `/config` | `routers/config.py`（频道等） |
+| `/models` | `routers/providers.py` |
+| `/local-models` | `routers/local_models.py` |
+| `/skills` | `routers/skills.py` + `skills_stream.py` |
+| `/mcp` | `routers/mcp.py` + `mcp_oauth.py` |
+| `/tools` | `routers/tools.py` |
+| `/workspace` | `routers/workspace.py` |
+| `/workspace/git` | `routers/git.py` |
+| `/workspace/checkpoints` | `routers/checkpoints.py` |
+| `/envs` | `routers/envs.py` |
+| `/cron` | `app/crons/api.py` |
+| `/chats` | `app/chats/api.py` |
+| `/console` | `routers/console.py` |
+| `/messages` | `routers/messages.py` |
+| `/files` | `routers/files.py` |
+| `/settings` | `routers/settings.py` |
+| `/plugins` / `/frontend_plugin` | 插件 |
+| `/pawapps` | `routers/pawapps.py` |
+| `/market` | `routers/market.py` |
+| `/backups` | `routers/backup.py` |
+| `/auth` | `routers/auth.py` |
+| `/approval` | `routers/approval.py` |
+| `/tool-calls` | `routers/tool_calls.py` |
+| `/coding-mode` | `routers/coding_mode.py` |
+| `/loops` | `routers/loops.py` |
+| `/harnesses` | `routers/harnesses.py` |
+| `/token-usage` / `/agent-stats` | 用量与统计 |
+| `/fork` | `routers/fork.py` |
+| `/access-control` / `/mail-access-control` | 访问控制 |
+| `/provider_oauth` | 提供商 OAuth |
+| voice | `routers/voice.py`（无统一 `/api` 前缀约定，见 `_app.py`） |
+| browser chrome WS | `_app.py` 挂载的 control_link 路由 |
 
-### 模型提供商 API — `/api/models`
-
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/api/models` | 列出所有提供商 |
-| PUT | `/api/models/{id}/config` | 配置提供商（API Key 等） |
-| POST | `/api/models/custom-providers` | 创建自定义提供商（OpenAI 兼容） |
-| DELETE | `/api/models/custom-providers/{id}` | 删除自定义提供商 |
-| POST | `/api/models/{id}/models` | 添加模型到提供商 |
-| DELETE | `/api/models/{id}/models/{model_id}` | 从提供商删除模型 |
-| GET | `/api/models/active` | 获取当前激活的 LLM |
-| PUT | `/api/models/active` | 设置激活的 LLM |
-
-### Skills API — `/api/skills`
-
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/api/skills` | 列出所有 Skills（builtin + customized） |
-| GET | `/api/skills/available` | 列出当前激活的 Skills |
-| GET | `/api/skills/hub/search` | 搜索 Hub 中的 Skills |
-| POST | `/api/skills/hub/install` | 从 Hub 安装 Skill |
-| POST | `/api/skills` | 创建本地 Skill |
-| POST | `/api/skills/{name}/enable` | 启用 Skill |
-| POST | `/api/skills/{name}/disable` | 禁用 Skill |
-| POST | `/api/skills/batch-enable` | 批量启用 Skills |
-| POST | `/api/skills/batch-disable` | 批量禁用 Skills |
-| DELETE | `/api/skills/{name}` | 删除 Skill |
-| GET | `/api/skills/{name}/files/{source}/{path}` | 读取 Skill 内部文件 |
-
-### 聊天 API — `/api/chats`
-
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/api/chats` | 列出聊天会话 |
-| POST | `/api/chats` | 创建聊天会话 |
-| GET | `/api/chats/{id}` | 获取聊天详情 |
-| PUT | `/api/chats/{id}` | 更新聊天信息 |
-| DELETE | `/api/chats/{id}` | 删除聊天 |
-| POST | `/api/chats/batch-delete` | 批量删除聊天 |
-
-### 定时任务 API — `/api/cron`
-
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/api/cron/jobs` | 列出所有任务 |
-| GET | `/api/cron/jobs/{id}` | 获取任务详情 |
-| POST | `/api/cron/jobs` | 创建任务 |
-| PUT | `/api/cron/jobs/{id}` | 更新任务 |
-| DELETE | `/api/cron/jobs/{id}` | 删除任务 |
-| POST | `/api/cron/jobs/{id}/pause` | 暂停任务 |
-| POST | `/api/cron/jobs/{id}/resume` | 恢复任务 |
-| POST | `/api/cron/jobs/{id}/run` | 立即执行（fire-and-forget） |
-| GET | `/api/cron/jobs/{id}/state` | 获取任务运行状态（上次/下次执行时间等） |
-
-### 本地模型 API — `/api/local-models`
-
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/api/local-models` | 列出本地模型 |
-| POST | `/api/local-models/download` | 下载模型 |
-| GET | `/api/local-models/download-status` | 查询下载状态 |
-| POST | `/api/local-models/cancel-download/{task_id}` | 取消下载 |
-| DELETE | `/api/local-models/{model_id}` | 删除本地模型 |
-
-### Ollama 模型 API — `/api/ollama-models`
-
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/api/ollama-models` | 列出 Ollama 模型 |
-| POST | `/api/ollama-models/download` | 拉取 Ollama 模型 |
-| GET | `/api/ollama-models/download-status` | 查询拉取状态 |
-| DELETE | `/api/ollama-models/download/{task_id}` | 取消拉取 |
-| DELETE | `/api/ollama-models/{name}` | 删除 Ollama 模型 |
-
-### MCP 服务 API — `/api/mcp`
-
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/api/mcp` | 列出所有 MCP 客户端 |
-| GET | `/api/mcp/{key}` | 获取 MCP 客户端详情 |
-| POST | `/api/mcp` | 创建 MCP 客户端 |
-| PUT | `/api/mcp/{key}` | 更新 MCP 客户端 |
-| PATCH | `/api/mcp/{key}/toggle` | 启用/禁用 MCP 客户端 |
-| DELETE | `/api/mcp/{key}` | 删除 MCP 客户端 |
-
-### 其他 API
-
-| 方法 | 路径 | 功能 |
-|------|------|------|
-| GET | `/api/workspace/download` | 下载工作空间（打包） |
-| POST | `/api/workspace/upload` | 上传工作空间（恢复） |
-| GET | `/api/envs` | 列出环境变量 |
-| PUT | `/api/envs` | 批量保存环境变量 |
-| DELETE | `/api/envs/{key}` | 删除环境变量 |
-| GET | `/api/console/push-messages` | 轮询 Console 推送消息 |
+聊天流式仍走 Console / chats 相关接口，内部调用 `Workspace.stream_query`。具体 verb 以各 router 源码为准，避免与 1.x 路径表一一臆造。
 
 ---
 
 ## 7. 数据流
 
-### 7.1 用户消息处理流
+### 7.1 用户消息
 
 ```
-┌─────────┐     消息      ┌──────────────┐  enqueue  ┌──────────┐
-│ 外部频道 │──────────────▶│ChannelManager│──────────▶│ 异步队列  │
-└─────────┘               └──────────────┘           └────┬─────┘
-                                                          │
-                                               Worker 消费（4 并发/频道）
-                                                          │
-                                                  ┌───────▼──────────┐
-                                                  │  防抖 & 消息合并   │
-                                                  │(相同 session 合并) │
-                                                  └───────┬──────────┘
-                                                          │
-                                              ┌───────────▼───────────┐
-                                              │    AgentRunner         │
-                                              │  load_session_state()  │
-                                              └───────────┬───────────┘
-                                                          │
-                                              ┌───────────▼───────────┐
-                                              │     CoPawAgent        │
-                                              │    (ReAct Loop)       │
-                                              └───────────┬───────────┘
-                                              Think       │    Act
-                                    ┌─────────────────────┼──────────────┐
-                                    │                     │              │
-                              ┌─────▼────┐         ┌─────▼────┐  ┌─────▼──┐
-                              │LLM 推理  │         │ 工具调用  │  │Skills  │
-                              └─────┬────┘         └─────┬────┘  └─────┬──┘
-                                    │                    │             │
-                              ┌─────▼────────────────────▼─────────────▼──┐
-                              │            Observe（结果汇总）              │
-                              └──────────────────────┬────────────────────┘
-                                                     │
-                                             ┌───────▼───────┐
-                                             │  返回响应       │
-                                             │save_session()  │
-                                             └───────┬───────┘
-                                                     │
-                                          ┌──────────▼──────────┐
-                                          │Channel.send_event() │
-                                          │ → MessageRenderer   │
-                                          │ → 外部频道发送       │
-                                          └─────────────────────┘
+外部频道 / Console / TUI / CLI
+    → Channel.enqueue(native_payload)
+    → UnifiedQueueManager（按 session 串行、防抖合并）
+    → build_agent_request_from_native
+    → Workspace.stream_query
+         ├─ backend=qwenpaw:
+         │     Runtime 8 阶段 → 斜杠命令?
+         │     AgentBuilder → QwenPawAgent
+         │     ReAct：LLM ↔ Toolkit（治理/沙箱/Drivers/Skills）
+         │     Scroll on_save / compress
+         └─ backend=codex|qoder: HarnessRuntime
+    → Channel.send_event + MessageRenderer
 ```
 
-### 7.2 定时任务执行流
+### 7.2 定时任务
 
 ```
-APScheduler 触发
-    ──▶ CronExecutor.execute(job)
-          │
-          ├── task_type == "text":
-          │   └── ChannelManager.send_text(channel, user_id, text)
-          │
-          └── task_type == "agent":
-              ├── AgentRunner.stream_query(request)
-              │   └── CoPawAgent 推理
-              └── ChannelManager.send_event(channel, user_id, event)
-                  └── 若出错 → ConsolePushStore.append(error_msg)
+APScheduler → CronExecutor
+  text  → ChannelManager.send_text
+  agent → workspace.stream_query → send_event
+心跳   → 读 HEARTBEAT.md → stream_query → main/last/inbox
 ```
 
-### 7.3 配置热重载流
+### 7.3 配置热重载
 
 ```
-config.json 变更
-    ──检测──▶ ConfigWatcher (FSEvents/inotify)
-                ──解析──▶ Config Pydantic 模型
-                ──对比──▶ 识别变更的频道配置
-                ──通知──▶ ChannelManager.replace_channel()
-                            ──停止旧频道──▶ 启动新频道实例
-
-MCP 配置变更
-    ──轮询──▶ MCPConfigWatcher (mtime + hash, 2s 间隔)
-                ──对比──▶ 识别变更的 MCP 客户端
-                ──通知──▶ MCPClientManager.replace_client()
-                            ──关闭旧连接──▶ 建立新连接
-                            ──重试限制──▶ 防止频繁失败
+config.json / agent.json / DriverCard
+  → ConfigWatcher / AgentConfigWatcher / driver_config_watcher
+  → ChannelManager.replace_channel
+  → DriverManager.build_drivers
+  → MultiAgentManager.reload_agent（世代守卫）
 ```
 
-### 7.4 记忆压缩流
+### 7.4 Scroll
 
 ```
-MemoryCompactionHook (pre_reasoning)
-    ──计算──▶ 当前 Token 用量
-    ──比较──▶ 阈值 = max_input_length × 0.7
-    ──超过──▶ 保留最近 3 条消息
-    ──压缩──▶ MemoryManager.compact_memory(older_msgs)
-    ──标记──▶ 旧消息标记为 COMPRESSED
-    ──存储──▶ 压缩摘要 → _compressed_summary
-    ──注入──▶ 下次 get_memory() 时 prepend 摘要
+每轮写入 history.db
+超窗 → EvictionIndex + continuation summary（缓存）
+模型调用 recall_history 回放原文
+启动 sync_all_scroll_agents 回填旧 sessions/*.json
 ```
 
 ---
 
 ## 8. 数据存储方案
 
-CoPaw 采用**纯文件系统存储**，无需外部数据库。
-
-### 存储目录结构
+仍是**文件系统优先**（Hub 控制面另有自己的 `hub/database.py`，仅 Hub 进程使用）。
 
 ```
-~/.copaw/  (或 COPAW_WORKING_DIR 指定的目录)
-├── config.json           # 主配置（频道配置、Agent 参数、心跳设置）
-├── providers.json        # LLM 提供商配置（内置 + 自定义 + 活跃模型）
-├── envs.json             # 环境变量（含 API Key，敏感数据）
-├── jobs.json             # 定时任务持久化
-├── chats.json            # 聊天会话元数据
-├── HEARTBEAT.md          # 心跳任务指令
-├── md_files/             # Agent 工作文件（Markdown 人设 + 笔记）
-│   ├── AGENTS.md         # Agent 行为指引
-│   ├── SOUL.md           # Agent 人格设定
-│   ├── PROFILE.md        # 用户画像
-│   └── BOOTSTRAP.md      # 首次启动引导
-├── memory/               # 长期记忆文件（ReMe-AI 管理）
-│   └── *.md              # 结构化记忆条目
-├── active_skills/        # 当前激活的 Skills
-│   └── <skill_name>/
-│       └── SKILL.md
-├── customized_skills/    # 用户创建/Hub 安装的 Skills
-│   └── <skill_name>/
-│       └── SKILL.md
-├── custom_channels/      # 用户自定义频道模块
-│   └── <channel_name>.py
-├── models/               # 下载的本地模型文件
-│   └── <model_name>/
-└── sessions/             # Session 状态序列化文件
-    └── <sanitized_session_id>.json
+~/.qwenpaw/          # 或 QWENPAW_WORKING_DIR；若 ~/.copaw 存在则用遗留目录
+├── config.json
+├── providers.json   # ProviderManager 持久化
+├── envs.json
+├── .env
+├── skill_pool/      # 全局 Skills + skill.json
+├── plugins/
+├── media/
+├── local_models/ / models/
+├── workspaces/
+│   └── <agent_id>/
+│       ├── agent.json
+│       ├── skills/ + skill.json
+│       ├── md_files/ 或根目录 AGENTS.md 等
+│       ├── memory/              # ReMe Markdown
+│       ├── drivers/             # DriverCard YAML
+│       ├── credentials.yaml
+│       ├── jobs.json / chats.json
+│       ├── sessions/*.json      # SafeJSONSession
+│       ├── history.db           # Scroll（路径以 HistoryStore 为准）
+│       └── coding_projects/
+├── token_usage.json
+└── HEARTBEAT.md                 # 也可按工作区覆盖，见 get_heartbeat_query_path
 ```
 
-### 写入策略
+密钥：`{WORKING_DIR}.secret`（`QWENPAW_SECRET_DIR`）。备份：`QWENPAW_BACKUP_DIR`。
 
-所有 JSON 文件采用**原子写入**（先写 `.tmp` 临时文件，再原子替换），避免写入中断导致数据损坏：
-
-```python
-def save_json(path, data):
-    tmp_path = path.with_suffix(".tmp")
-    tmp_path.write_text(json.dumps(data))
-    tmp_path.replace(path)  # 原子替换
-```
-
-### 存储特点
-
-| 特点 | 说明 |
-|------|------|
-| 零依赖 | 无需安装数据库，开箱即用 |
-| 可移植 | 工作目录可通过 `/api/workspace/download` 打包备份 |
-| 可读性 | JSON + Markdown，人类可直接编辑 |
-| 热重载 | 部分配置变更无需重启（ConfigWatcher + MCPConfigWatcher） |
-| 单机优先 | 适合个人用户，非分布式场景 |
-| 跨平台 | SafeJSONSession 确保文件名在所有 OS 上安全 |
+JSON 写入：**先 `.tmp` 再 `Path.replace()`**。YAML 治理规则同样原子写（`write_yaml_atomic`）。
 
 ---
 
 ## 9. 前端架构
 
-Console 控制台是一个 **React 18 + TypeScript** 单页应用，使用 `@agentscope-ai/design` 提供的 bailianTheme 主题。
+`console/`：React 18 + Vite 6 + Ant Design 5 + `@agentscope-ai/design`。路由与侧栏改为 **registry 数据驱动**（`layouts/registry/builtinRoutes.tsx`、`builtinMenu.ts`），插件可 `QwenPaw.route.add` / `menu.add`。
 
-### 技术选型
+### 内置路由（节选）
 
-| 层 | 技术 |
-|----|------|
-| 框架 | React 18 |
-| 路由 | react-router-dom v7 (BrowserRouter) |
-| UI 组件库 | Ant Design 5 + @agentscope-ai/design |
-| 样式 | antd-style (CSS-in-JS) + Less |
-| 状态管理 | React useState/useEffect + ahooks |
-| 国际化 | i18next + react-i18next |
-| 聊天组件 | @agentscope-ai/chat |
-| HTTP 客户端 | 自封装 request 模块 |
-| 构建工具 | Vite 6 |
+| 路径 | 页面 |
+|------|------|
+| `/` → `/chat` | Chat |
+| `/files` | 通用文件工作区 |
+| `/channels` `/sessions` `/inbox` `/cron-jobs` `/heartbeat` | Control |
+| `/skills` `/skill-pool` `/tools` `/mcp` `/acp` `/checkpoints` `/agent-config` | Agent |
+| `/agents` `/models` `/environments` `/offload-policy` `/security` `/token-usage` `/agent-stats` `/voice-transcription` `/debug` `/backups` | Settings |
+| `/market` `/imports` `/apps/:appId` | 市场 / PawPort / App Center |
+| `/settings/*` | SettingsCenter |
 
-### 页面路由
+组件模式仍为 `pages/<Feature>/index.tsx` + `use*.ts` + `components/`。API 在 `console/src/api/modules/`。用户可见文案走 i18n（`locales/en.json`、`zh.json`）。状态：ahooks + zustand。
 
-| 路径 | 页面 | 所属分组 |
-|------|------|---------|
-| `/chat` | Chat 聊天主界面 | — |
-| `/channels` | 频道配置 | Control |
-| `/sessions` | 会话管理 | Control |
-| `/cron-jobs` | 定时任务管理 | Control |
-| `/skills` | Skills 管理 | Agent |
-| `/mcp` | MCP 服务管理 | Agent |
-| `/workspace` | 工作文件/记忆文件编辑 | Agent |
-| `/agent-config` | Agent 运行配置 | Agent |
-| `/models` | 模型提供商 + 本地模型 + Ollama | Settings |
-| `/environments` | 环境变量管理 | Settings |
+生产：FastAPI 托管 `src/qwenpaw/console/`（或 `QWENPAW_CONSOLE_STATIC_DIR`）。开发：Vite 代理 `/api` 到 8088。`index.html` 强制 no-cache。
 
-默认路由 `/` 重定向到 `/chat`。
-
-### API 客户端组织
-
-```
-api/
-├── config.ts          # 基础 URL 配置
-├── request.ts         # 请求封装（拦截器、错误处理）
-├── index.ts           # 统一导出
-├── types/             # TypeScript 类型定义（与后端 Pydantic 模型对应）
-│   ├── agent.ts
-│   ├── channel.ts
-│   ├── chat.ts
-│   ├── cronjob.ts
-│   ├── env.ts
-│   ├── mcp.ts
-│   ├── provider.ts
-│   ├── skill.ts
-│   └── workspace.ts
-└── modules/           # 按模块分离的 API 调用函数
-    ├── agent.ts       # Agent 工作文件/记忆 API
-    ├── channel.ts     # 频道配置 API
-    ├── chat.ts        # 聊天会话 API
-    ├── console.ts     # Console 推送消息 API
-    ├── cronjob.ts     # 定时任务 API
-    ├── env.ts         # 环境变量 API
-    ├── localModel.ts  # 本地模型 API
-    ├── mcp.ts         # MCP 服务 API
-    ├── ollamaModel.ts # Ollama 模型 API
-    ├── provider.ts    # 提供商 API
-    ├── skill.ts       # Skills API
-    └── workspace.ts   # 工作空间 API
-```
-
-### 页面组件模式
-
-每个功能页面通常遵循以下结构：
-
-```
-pages/<Feature>/
-├── index.tsx              # 页面主组件
-├── use<Feature>.ts        # 自定义 Hook（数据获取 + 状态管理）
-└── components/
-    ├── index.ts           # 组件统一导出
-    ├── <Feature>Card.tsx  # 卡片组件
-    └── <Feature>Drawer.tsx # 抽屉表单组件
-```
-
-### 前端与后端通信
-
-- **生产模式**：FastAPI 直接服务 `src/copaw/console/` 目录下的静态文件（构建时从 `console/dist/` 复制）
-- **开发模式**：Vite Dev Server（端口 5173）+ FastAPI（端口 8088），Vite 配置代理转发 `/api/*` 到后端
-- **Console 推送**：前端通过轮询 `/api/console/push-messages` 获取 Cron 结果等推送消息
+桌面：Tauri 2（`@tauri-apps/*`，`qwenpaw desktop`）。
 
 ---
 
 ## 10. CLI 系统
 
-CoPaw 提供完整的命令行界面，基于 click（或类似框架）构建：
+入口：`qwenpaw = qwenpaw.cli.main:cli`（兼容脚本名 `copaw`）。`LazyGroup` 懒加载子命令。
 
-### 命令总览
+**无子命令**（或第一个位置参数像项目路径）→ TUI（`cli/tui/launch.py`）。默认 API `127.0.0.1:8088`（`read_runtime_api` / `read_last_api`）。
 
-| 命令 | 文件 | 功能 | 模式 |
-|------|------|------|------|
-| `copaw init` | `init_cmd.py` | 交互式初始化配置 | 本地 |
-| `copaw app` | `app_cmd.py` | 启动 Web 服务 | 本地 |
-| `copaw channels` | `channels_cmd.py` | 频道管理 | HTTP |
-| `copaw models` | `providers_cmd.py` | LLM 提供商与模型管理 | HTTP |
-| `copaw skills` | `skills_cmd.py` | Skills 管理 | HTTP |
-| `copaw cron` | `cron_cmd.py` | 定时任务管理 | HTTP |
-| `copaw clean` | `clean_cmd.py` | 清理工作目录 | 本地 |
+`lazy_subcommands`（`cli/main.py`）：
 
-**两种运行模式：**
-- **本地模式**：`init`、`app`、`clean` 直接操作文件系统
-- **HTTP 模式**：`channels`、`models`、`skills`、`cron` 通过 `httpx` 调用运行中的 FastAPI API，需要服务已启动
+| 命令 | 模块 |
+|------|------|
+| `app` | `app_cmd.py` 启动 FastAPI |
+| `init` | `init_cmd.py` |
+| `tui` | `tui/launch.py` |
+| `hub` | `hub_cmd.py` |
+| `acp` | `acp_cmd.py` |
+| `channels` / `channel` | `channels_cmd.py` |
+| `chats` / `chat` | `chats_cmd.py` |
+| `cron` | `cron_cmd.py` |
+| `models` | `providers_cmd.py` |
+| `skills` | `skills_cmd.py` |
+| `env` | `env_cmd.py` |
+| `agents` / `agent` | `agents_cmd.py` |
+| `plugin` | `plugin_commands.py` |
+| `daemon` | `daemon_cmd.py` |
+| `desktop` | `desktop_cmd.py` |
+| `task` | `task_cmd.py` |
+| `doctor` | `doctor_cmd.py` |
+| `auth` | `auth_cmd.py` |
+| `clean` / `uninstall` / `update` / `shutdown` | 对应 `*_cmd.py` |
+| `auto` | `@api_action` 生成的 HTTP 客户端子命令 |
 
-### CLI 辅助工具
-
-| 工具 | 文件 | 功能 |
-|------|------|------|
-| `prompt_confirm` | `cli/utils.py` | 交互式确认（questionary） |
-| `prompt_choice` | `cli/utils.py` | 交互式选择 |
-| `prompt_checkbox` | `cli/utils.py` | 交互式多选 |
-| `client(base_url)` | `cli/http.py` | httpx 客户端（自动加 `/api` 前缀） |
-| `print_json(data)` | `cli/http.py` | JSON 美化输出 |
+`cli/mission_cmd.py` 存在，供 Mission 相关调用；主分组以 `lazy_subcommands` 为准。HTTP 模式命令依赖已启动的 `qwenpaw app`（`cli/http.py`）。
 
 ---
 
 ## 11. 部署方案
 
-### Docker 部署（推荐）
+### Docker（`deploy/`）
 
-#### 多阶段 Dockerfile
+多阶段：`console-builder`（`npm ci && npm run build`）→ runtime（Node 基础镜像 + Python venv + Chromium + Xvfb/XFCE + supervisor）。
 
-```
-Stage 1: console-builder (Node.js 镜像)
-    ├── COPY console/
-    ├── npm ci --include=dev
-    └── npm run build → dist/
+- `QWENPAW_WORKING_DIR=/app/working`
+- `QWENPAW_SECRET_DIR=/app/working.secret`
+- `QWENPAW_BACKUP_DIR=/app/working.backups`
+- `QWENPAW_DISABLED_CHANNELS` 默认 `imessage`
+- `QWENPAW_PORT` 默认 8088
+- `PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium`
+- `QWENPAW_RUNNING_IN_CONTAINER=1`
 
-Stage 2: runtime (Python + Chromium)
-    ├── 安装系统依赖
-    │   ├── Python3 + venv
-    │   ├── Chromium + 依赖库（浏览器自动化）
-    │   ├── Xvfb + XFCE4（虚拟桌面，支持 desktop_screenshot）
-    │   ├── supervisor（进程管理）
-    │   └── 中文字体（wqy-zenhei, wqy-microhei）
-    ├── pip install . (copaw 包)
-    ├── COPY --from=console-builder dist/ → src/copaw/console/
-    ├── copaw init --defaults --accept-security
-    └── EXPOSE 8088
-```
+supervisord：`dbus`、`xvfb`（`:1` 1280x800x24）、`xfce4`、`app` → `qwenpaw app --host 0.0.0.0 --port ${QWENPAW_PORT}`。
 
-#### supervisord 进程管理
-
-Docker 容器内通过 supervisord 同时运行多个进程：
-
-| 进程 | 优先级 | 功能 |
-|------|--------|------|
-| `dbus` | 默认 | D-Bus 系统总线（XFCE4 依赖） |
-| `xvfb` | 10 | 虚拟帧缓冲（`:1`, 1280x800x24） |
-| `xfce4` | 20 | XFCE4 桌面环境（浏览器操作和截图用） |
-| `app` | 30 | `copaw app --host 0.0.0.0 --port $COPAW_PORT` |
-
-#### Docker 运行
+### 本地
 
 ```bash
-# 基本运行
-docker run -p 8088:8088 -v copaw-data:/app/working agentscope/copaw:latest
-
-# 带环境变量
-docker run -p 8088:8088 \
-  -e DASHSCOPE_API_KEY=your_key \
-  -e COPAW_PORT=8088 \
-  -e COPAW_ENABLED_CHANNELS="dingtalk,feishu,qq,console" \
-  -v copaw-data:/app/working \
-  agentscope/copaw:latest
-```
-
-#### Docker 环境默认配置
-
-| 变量 | 默认值 | 说明 |
-|------|--------|------|
-| `COPAW_WORKING_DIR` | `/app/working` | 工作目录 |
-| `COPAW_PORT` | `8088` | 服务端口（通过 entrypoint.sh 注入 supervisord） |
-| `COPAW_ENABLED_CHANNELS` | `dingtalk,feishu,qq,console` | 可用频道（不含 imessage/discord） |
-| `DISPLAY` | `:1` | 虚拟显示器（Xvfb 提供） |
-
-### 本地开发
-
-```bash
-# 安装依赖
 pip install -e ".[dev]"
-
-# 初始化配置
-copaw init
-
-# 启动服务
-copaw app --host 0.0.0.0 --port 8088
-
-# 前端开发（另一个终端）
+qwenpaw init --defaults
+qwenpaw app --host 0.0.0.0 --port 8088
+# 另一终端
 cd console && npm ci && npm run dev
 ```
 
-### PyPI 安装
+### PyPI
 
 ```bash
-pip install copaw
-copaw init --defaults
-copaw app
+pip install qwenpaw
+qwenpaw init --defaults
+qwenpaw app
 ```
 
 ---
 
 ## 12. 扩展机制
 
-### 12.1 自定义频道
+| 扩展点 | 做法 |
+|--------|------|
+| 频道 | 实现 `BaseChannel`，以 plugin type `channel` 注册（不要再丢 `custom_channels/`） |
+| Skills | 池或工作区 `SKILL.md`；API / Console / Hub |
+| 工具 | `@tool_descriptor` + 在 `tools/__init__.py` import；或 plugin type `tool` |
+| LLM | `/api/models` 自定义 OpenAI 兼容，或 plugin type `provider` |
+| 记忆后端 | 实现 `BaseMemoryManager`，`memory_registry.register`，plugin type `memory` |
+| 钩子 / 斜杠命令 / Mode | `WorkspacePlugins` 或 plugin `hook` / `command` |
+| MCP | DriverCard + Console MCP 页（底层 `DriverManager`） |
+| PawApp | `meta.pawapp` 插件 + `PawApp` SDK |
+| 前端路由/菜单 | `QwenPaw.route.add` / `menu.add` |
+| Harness | `harnesses/` 适配器 + agent `backend` |
+| Doctor | entry point 组 `qwenpaw.doctor`（仍加载遗留 `copaw.doctor`） |
 
-在 `working/custom_channels/` 目录下创建 Python 文件，实现 `BaseChannel` 接口即可自动被发现和加载。
-
-```python
-from copaw.app.channels.base import BaseChannel
-
-class MyChannel(BaseChannel):
-    channel = "my_channel"
-
-    async def send(self, to_handle, text, meta):
-        # 发送消息到你的平台
-        ...
-
-    async def start(self):
-        # 启动连接
-        ...
-```
-
-注册表在启动时自动从 `CUSTOM_CHANNELS_DIR` 发现并合并到内置频道列表中。
-
-### 12.2 自定义 Skills
-
-两种方式创建 Skills：
-
-**方式一：文件系统**
-
-在 `working/customized_skills/<skill_name>/` 下创建 `SKILL.md`，包含 YAML front matter 和 Markdown 指令。
-
-**方式二：Web 控制台 / API**
-
-通过 `POST /api/skills` 或 Web 控制台可视化创建。
-
-Skills 创建后需通过 `enable_skill()` 激活（同步到 `active_skills/`），Agent 才会加载。
-
-### 12.3 自定义 LLM 提供商
-
-通过 `/api/models/custom-providers` 接口或 Web 控制台添加兼容 OpenAI 接口的自定义提供商。支持配置：
-
-- `base_url`：API 端点
-- `api_key`：认证密钥
-- 自定义模型列表
-
-### 12.4 MCP 服务扩展
-
-通过 Web 控制台或 `/api/mcp` 接口配置 MCP 服务端点。MCPConfigWatcher 自动检测配置变更并热重载。Agent 自动发现 MCP 服务暴露的工具并纳入 ReAct 循环可调用的工具集。
-
-### 12.5 工作空间迁移
-
-通过 `/api/workspace/download` 导出完整工作空间（打包为压缩文件），通过 `/api/workspace/upload` 导入恢复，实现配置和数据的跨机器迁移。
+工作区迁移：`/api/workspace` 下载上传、`BackupManager`、PawPort（`portability/`）。
 
 ---
 
-## 附录：全局常量
+## 13. 1.x → 2.x 映射
 
-| 常量 | 来源 | 默认值 |
-|------|------|--------|
-| `WORKING_DIR` | `COPAW_WORKING_DIR` | `~/.copaw` |
-| `CONFIG_FILE` | `COPAW_CONFIG_FILE` | `config.json` |
-| `JOBS_FILE` | `COPAW_JOBS_FILE` | `jobs.json` |
-| `CHATS_FILE` | `COPAW_CHATS_FILE` | `chats.json` |
-| `HEARTBEAT_FILE` | `COPAW_HEARTBEAT_FILE` | `HEARTBEAT.md` |
-| `HEARTBEAT_DEFAULT_EVERY` | — | `"30m"` |
+| 1.x（约 2026-03 CoPaw） | 2.x QwenPaw |
+|-------------------------|-------------|
+| `src/copaw`、`CoPawAgent` | `src/qwenpaw`、`QwenPawAgent` |
+| agentscope-runtime `AgentRunner` / `AgentApp` | `Workspace.stream_query` + `Runtime`；无 AgentApp |
+| 全局单 Agent + `~/.copaw/md_files` | 多 `Workspace`，默认 `~/.qwenpaw/workspaces/<id>` |
+| `MCPClientManager` | `DriverManager` + `MCPDriverHandler` |
+| `customized_skills` / `active_skills` | `skill_pool` + 工作区 `skills/` |
+| `MemoryCompactionHook` + `CoPawInMemoryMemory` | `ScrollContextManager` + `history.db` |
+| `MemoryManager`(ReMe 0.3) | `ReMeLightMemoryManager`(ReMe 0.4) |
+| 每频道固定 4 Worker | `UnifiedQueueManager` 按 session 按需 consumer |
+| `custom_channels/` 扫描 | 插件 `channel` 类型 |
+| 无 TUI / Hub / PawApp / Loop / Drivers | 均已在对应源码目录落地 |
+
+---
+
+## 附录：全局常量（`constant.py`）
+
+| 常量 | 环境变量 / 来源 | 默认 |
+|------|-----------------|------|
+| `WORKING_DIR` | `QWENPAW_WORKING_DIR` | 显式路径 → 否则若 `~/.copaw` 存在则用之 → 否则 `~/.qwenpaw` |
+| `SECRET_DIR` | `QWENPAW_SECRET_DIR` | `{WORKING_DIR}.secret` |
+| `CONFIG_FILE` | `QWENPAW_CONFIG_FILE` | `config.json` |
+| `JOBS_FILE` / `CHATS_FILE` | `QWENPAW_*` | `jobs.json` / `chats.json` |
+| `HEARTBEAT_FILE` | `QWENPAW_HEARTBEAT_FILE` | `HEARTBEAT.md` |
+| `HEARTBEAT_DEFAULT_EVERY` | — | `"6h"` |
 | `HEARTBEAT_DEFAULT_TARGET` | — | `"main"` |
-| `ACTIVE_SKILLS_DIR` | — | `WORKING_DIR/active_skills` |
-| `CUSTOMIZED_SKILLS_DIR` | — | `WORKING_DIR/customized_skills` |
-| `MEMORY_DIR` | — | `WORKING_DIR/memory` |
-| `CUSTOM_CHANNELS_DIR` | — | `WORKING_DIR/custom_channels` |
-| `MODELS_DIR` | — | `WORKING_DIR/models` |
-| `LOG_LEVEL` | `COPAW_LOG_LEVEL` | `info` |
-| `DOCS_ENABLED` | `COPAW_OPENAPI_DOCS` | `false` |
-| `MEMORY_COMPACT_KEEP_RECENT` | `COPAW_MEMORY_COMPACT_KEEP_RECENT` | `3` |
-| `MEMORY_COMPACT_RATIO` | `COPAW_MEMORY_COMPACT_RATIO` | `0.7` |
+| `PLUGINS_DIR` | — | `{WORKING_DIR}/plugins` |
+| `DEFAULT_LOCAL_PROVIDER_DIR` | — | `{WORKING_DIR}/local_models` |
+| `CODING_PROJECT_SUBDIR` | — | `coding_projects` |
+| `BUILTIN_QA_AGENT_ID` | — | `QwenPaw_QA_Agent_0.2` |
+| `LOG_LEVEL_ENV` | `QWENPAW_LOG_LEVEL` | `info` |
+| `PROJECT_NAME` | — | `QwenPaw` |
+| `CUSTOM_AGENT_STARTUP_CONCURRENCY` | `QWENPAW_CUSTOM_AGENT_STARTUP_CONCURRENCY` | `5` |
 
 ---
 
-*本文档基于源码分析生成，如有遗漏请参考源码及官方文档（`website/public/docs/`）。*
+*本文档根据 QwenPaw 2.x 源码整理。概念图可对照官网 `website/public/docs/architecture.zh.md`；类名与路径以本仓库为准。*
